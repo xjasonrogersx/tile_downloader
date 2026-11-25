@@ -1,0 +1,4 @@
+token.txt
+artifacts/*
+log.txt
+__pycache__/merge_gltf.cpython-312.pyc
