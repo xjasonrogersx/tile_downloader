@@ -39,6 +39,21 @@ and helps retain both road-level and elevated building geometry.
 The web UI samples the region at approximately 15 metre intervals. Larger
 radii therefore require more tile requests and may take longer.
 
+## Download methods
+
+The web UI provides two methods:
+
+- **Grid sampling:** the original method. It samples geographic points at
+	several heights and downloads matching street-level tiles.
+- **Camera sweep:** `download_tiles_v2.py` places bounded camera viewpoints
+	over the selected area. Each viewpoint pans through four headings and uses
+	three downward rays at different tilts and ranges. Matching tiles are
+	deduplicated before merging.
+
+Camera sweep is intended to improve coverage of surrounding sides and roofs,
+but it is still a downloader-side geometric approximation rather than a full
+Cesium renderer. It can make more requests than a small grid selection.
+
 ## Run from the command line
 
 ```bash

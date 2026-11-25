@@ -75,17 +75,20 @@ def write_metadata(area_dir: Path, values: dict) -> None:
     metadata_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
 
-def run_download(latitude: float, longitude: float, radius_meters: float, grid_steps: int, job_id: str, area_id: str) -> None:
+def run_download(latitude: float, longitude: float, radius_meters: float, grid_steps: int, method: str, job_id: str, area_id: str) -> None:
     global download_process
     area_dir = ARTIFACTS_DIR / area_id
+    script_name = "download_tiles_v2.py" if method == "camera" else "download_tiles.py"
+    effective_steps = max(3, min(7, math.ceil(radius_meters / 50) + 1)) if method == "camera" else grid_steps
     command = [
         sys.executable,
         "-u",
-        str(BASE_DIR / "download_tiles.py"),
+        str(BASE_DIR / script_name),
         "--latitude", str(latitude),
         "--longitude", str(longitude),
         "--radius-meters", str(radius_meters),
-        "--grid-steps", str(grid_steps),
+        "--grid-steps", str(effective_steps),
+        "--workers", "8",
         "--artifact-dir", str(area_dir),
     ]
     try:
@@ -209,7 +212,12 @@ class Handler(BaseHTTPRequestHandler):
             latitude = float(data["latitude"])
             longitude = float(data["longitude"])
             radius = max(5.0, min(1000.0, float(data["radiusMeters"])))
+            method = data.get("method", "grid")
+            if not isinstance(method, str) or method not in {"grid", "camera"}:
+                self.send_json({"error": "Unknown download method."}, 400)
+                return
             estimate = estimate_region(radius)
+            sampling_steps = max(3, min(7, math.ceil(radius / 50) + 1)) if method == "camera" else estimate["grid_steps"]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             self.send_json({"error": "Invalid region parameters."}, 400)
             return
@@ -221,9 +229,9 @@ class Handler(BaseHTTPRequestHandler):
             area_id = "area-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + job_id[:6]
             area_dir = ARTIFACTS_DIR / area_id
             area_dir.joinpath("parts").mkdir(parents=True, exist_ok=True)
-            write_metadata(area_dir, {"area_id": area_id, "name": area_id, "notes": "", "created_at": datetime.now(timezone.utc).isoformat(), "latitude": latitude, "longitude": longitude, "radius_meters": radius, "grid_steps": estimate["grid_steps"]})
+            write_metadata(area_dir, {"area_id": area_id, "name": area_id, "notes": "", "created_at": datetime.now(timezone.utc).isoformat(), "latitude": latitude, "longitude": longitude, "radius_meters": radius, "grid_steps": sampling_steps, "method": method})
             job.update({"id": job_id, "area_id": area_id, "status": "running", "message": "Starting download...", "progress": 0, "progress_total": estimate["samples"], "lines": [], "artifacts": []})
-        thread = threading.Thread(target=run_download, args=(latitude, longitude, radius, estimate["grid_steps"], job_id, area_id), daemon=True)
+        thread = threading.Thread(target=run_download, args=(latitude, longitude, radius, sampling_steps, method, job_id, area_id), daemon=True)
         thread.start()
         self.send_json({"id": job_id, "area_id": area_id, **estimate})
 

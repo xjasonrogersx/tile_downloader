@@ -6,6 +6,7 @@ import math
 import os
 import struct
 import sys
+import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -34,6 +35,8 @@ CENTER_LON = -0.466216
 HEIGHT = 162.0
 ELEVATION_API_URL = "https://api.open-meteo.com/v1/forecast"
 HEIGHT_PROBE_OFFSETS = (-50.0, 0.0, 25.0, 50.0, 75.0, 100.0, 150.0)
+FETCH_CACHE = {}
+FETCH_CACHE_LOCK = threading.Lock()
 
 
 class OutputTee:
@@ -148,6 +151,11 @@ def build_tile_url(uri: str, api_key: str, parent_url: str | None = None) -> str
 
 
 def fetch_tile_or_json(url: str) -> tuple[str, dict | bytes]:
+    with FETCH_CACHE_LOCK:
+        cached = FETCH_CACHE.get(url)
+    if cached is not None:
+        return cached
+
     last_error = None
     for attempt in range(4):
         try:
@@ -157,8 +165,12 @@ def fetch_tile_or_json(url: str) -> tuple[str, dict | bytes]:
             content = resp.content
 
             if "application/json" in content_type or content.startswith(b"{"):
-                return "json", resp.json()
-            return "glb", content
+                result = ("json", resp.json())
+            else:
+                result = ("glb", content)
+            with FETCH_CACHE_LOCK:
+                FETCH_CACHE[url] = result
+            return result
         except requests.RequestException as exc:
             last_error = exc
             if attempt == 3:
