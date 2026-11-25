@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import sys
@@ -30,11 +31,12 @@ from download_tiles import (
 )
 
 CAMERA_EYE_OFFSET = 30.0
-PAN_HEADINGS = (0.0, 90.0, 180.0, 270.0)
+PAN_HEADINGS = tuple(float(deg) for deg in range(0, 360, 45))
 CAMERA_TILTS = (35.0, 55.0, 75.0)
 CAMERA_RANGES = (20.0, 60.0, 120.0)
 CAMERA_TARGET_HEIGHT_OFFSETS = (-50.0, 0.0, 50.0, 100.0)
 GROUND_HEIGHT_OFFSETS = (-25.0, 0.0, 25.0, 50.0)
+RAY_FRACTIONS = (0.35, 0.7, 1.0)
 
 
 class OutputTee:
@@ -58,27 +60,45 @@ def offset_latlon(lat: float, lon: float, east_m: float, north_m: float) -> tupl
     return lat + lat_delta, lon + lon_delta
 
 
-def camera_ray_targets(lat: float, lon: float, camera_height: float, terrain_height: float, footprint_half_m: float) -> list[tuple[float, float, float]]:
-    targets = []
-    # Explicitly sample the ground below the camera so narrow roads are not
-    # lost while the wider pan rays find elevated building geometry.
-    ground_offsets = (-footprint_half_m, 0.0, footprint_half_m)
+def camera_ray_targets(
+    lat: float,
+    lon: float,
+    camera_height: float,
+    terrain_height: float,
+    footprint_half_m: float,
+) -> list[tuple[float, float, float]]:
+    targets: list[tuple[float, float, float]] = []
+
+    # Sample a denser ground grid below the camera so narrow roads and low
+    # structures are captured alongside wider camera sweeps.
+    ground_offsets = (
+        -footprint_half_m,
+        -0.5 * footprint_half_m,
+        0.0,
+        0.5 * footprint_half_m,
+        footprint_half_m,
+    )
     for north_m in ground_offsets:
         for east_m in ground_offsets:
             target_lat, target_lon = offset_latlon(lat, lon, east_m, north_m)
             for height_offset in GROUND_HEIGHT_OFFSETS:
                 targets.append((target_lat, target_lon, terrain_height + height_offset))
+
     for heading in PAN_HEADINGS:
         heading_rad = math.radians(heading)
         for tilt, distance in zip(CAMERA_TILTS, CAMERA_RANGES):
             tilt_rad = math.radians(tilt)
-            horizontal_distance = distance * math.cos(tilt_rad)
-            east_m = horizontal_distance * math.sin(heading_rad)
-            north_m = horizontal_distance * math.cos(heading_rad)
-            target_lat, target_lon = offset_latlon(lat, lon, east_m, north_m)
+            max_horiz = distance * math.cos(tilt_rad)
             for height_offset in CAMERA_TARGET_HEIGHT_OFFSETS:
-                target_height = terrain_height + height_offset
-                targets.append((target_lat, target_lon, target_height))
+                end_height = terrain_height + height_offset
+                for frac in RAY_FRACTIONS:
+                    horiz = max_horiz * frac
+                    east_m = horiz * math.sin(heading_rad)
+                    north_m = horiz * math.cos(heading_rad)
+                    interp_height = camera_height + (end_height - camera_height) * frac
+                    target_lat, target_lon = offset_latlon(lat, lon, east_m, north_m)
+                    targets.append((target_lat, target_lon, interp_height))
+
     return targets
 
 
@@ -95,17 +115,32 @@ def camera_viewpoints(lat: float, lon: float, radius_m: float, steps: int, cente
     return viewpoints
 
 
-def download_camera_viewpoint(viewpoint, root_tileset: dict, root_url: str, terrain_height: float, footprint_half_m: float):
+def download_camera_viewpoint(
+    viewpoint,
+    root_tileset: dict,
+    root_url: str,
+    terrain_height: float,
+    footprint_half_m: float,
+):
     index, lat, lon, camera_height = viewpoint
     started_at = time.perf_counter()
     matches = []
-    for target_lat, target_lon, target_height in camera_ray_targets(lat, lon, camera_height, terrain_height, footprint_half_m):
+    for target_lat, target_lon, target_height in camera_ray_targets(
+        lat, lon, camera_height, terrain_height, footprint_half_m
+    ):
         target_ecef = latlon_to_ecef(target_lat, target_lon, target_height)
         matches.extend(traverse_for_leaf_glbs(root_tileset["root"], target_ecef, API_KEY, root_url))
     return index, lat, lon, matches, time.perf_counter() - started_at
 
 
-def main(workers: int, latitude: float, longitude: float, radius_meters: float, grid_steps: int, artifact_dir: Path):
+def main(
+    workers: int,
+    latitude: float,
+    longitude: float,
+    radius_meters: float,
+    grid_steps: int,
+    artifact_dir: Path,
+):
     global OUTPUT_PATH, PARTS_PATH
     started_at = time.perf_counter()
     output_path = artifact_dir / "stitched.gltf"
@@ -123,19 +158,34 @@ def main(workers: int, latitude: float, longitude: float, radius_meters: float, 
     center_height = fetch_center_height(latitude, longitude)
     viewpoints = camera_viewpoints(latitude, longitude, radius_meters, grid_steps, center_height)
     footprint_half_m = radius_meters / max(1, grid_steps - 1)
-    print(f"Using camera elevation {center_height + CAMERA_EYE_OFFSET:.1f} m ({center_height:.1f} m terrain + {CAMERA_EYE_OFFSET:.1f} m eye offset).")
-    print(f"Camera sweep: {len(viewpoints)} viewpoints, ground footprint half-width {footprint_half_m:.1f} m, plus {len(PAN_HEADINGS)} pan headings, {len(CAMERA_TILTS)} downward rays, and {len(CAMERA_TARGET_HEIGHT_OFFSETS)} height bands per ray.")
+    print(
+        f"Using camera elevation {center_height + CAMERA_EYE_OFFSET:.1f} m "
+        f"({center_height:.1f} m terrain + {CAMERA_EYE_OFFSET:.1f} m eye offset)."
+    )
+    print(
+        f"Camera sweep: {len(viewpoints)} viewpoints, ground footprint half-width {footprint_half_m:.1f} m, "
+        f"plus {len(PAN_HEADINGS)} pan headings, {len(CAMERA_TILTS)} downward rays, "
+        f"{len(CAMERA_TARGET_HEIGHT_OFFSETS)} height bands, and {len(RAY_FRACTIONS)} ray steps."
+    )
     print(f"Using {workers} concurrent camera workers.")
 
-    unique_glbs = set()
+    unique_glbs: set[bytes] = set()
     downloaded_tiles = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = executor.map(lambda point: download_camera_viewpoint(point, root_tileset, root_url, center_height, footprint_half_m), viewpoints)
+        results = executor.map(
+            lambda point: download_camera_viewpoint(
+                point, root_tileset, root_url, center_height, footprint_half_m
+            ),
+            viewpoints,
+        )
         for completed, (index, lat, lon, matches, elapsed) in enumerate(results, start=1):
-            print(f"[{completed}/{len(viewpoints)}] Camera viewpoint {index} at Lat: {lat:.6f}, Lon: {lon:.6f} took {elapsed:.2f}s.")
+            print(
+                f"[{completed}/{len(viewpoints)}] Camera viewpoint {index} "
+                f"at Lat: {lat:.6f}, Lon: {lon:.6f} took {elapsed:.2f}s."
+            )
             new_tiles = 0
             for glb_bytes in matches:
-                content_hash = hash(glb_bytes)
+                content_hash = hashlib.sha256(glb_bytes).digest()
                 if content_hash in unique_glbs:
                     continue
                 unique_glbs.add(content_hash)
@@ -153,11 +203,16 @@ def main(workers: int, latitude: float, longitude: float, radius_meters: float, 
     merge_started_at = time.perf_counter()
     merge_gltf(parts_path, output_path)
     print(f"Successfully saved combined street GLTF to: {output_path}")
-    print(f"Merge took {time.perf_counter() - merge_started_at:.2f}s; total camera download and merge took {time.perf_counter() - started_at:.2f}s.")
+    print(
+        f"Merge took {time.perf_counter() - merge_started_at:.2f}s; "
+        f"total camera download and merge took {time.perf_counter() - started_at:.2f}s."
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download Google 3D Tiles using a bounded panning-camera sweep.")
+    parser = argparse.ArgumentParser(
+        description="Download Google 3D Tiles using a bounded panning-camera sweep."
+    )
     parser.add_argument("--latitude", type=float, default=CENTER_LAT)
     parser.add_argument("--longitude", type=float, default=CENTER_LON)
     parser.add_argument("--radius-meters", type=float, default=100.0)
@@ -171,4 +226,11 @@ if __name__ == "__main__":
     with (BASE_DIR / "log.txt").open("a", encoding="utf-8") as log_file:
         tee = OutputTee(sys.__stdout__, log_file)
         with redirect_stdout(tee), redirect_stderr(tee):
-            main(args.workers, args.latitude, args.longitude, args.radius_meters, args.grid_steps, artifact_dir)
+            main(
+                args.workers,
+                args.latitude,
+                args.longitude,
+                args.radius_meters,
+                args.grid_steps,
+                artifact_dir,
+            )
