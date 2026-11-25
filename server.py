@@ -50,6 +50,7 @@ def area_metadata(area_dir: Path) -> dict:
 
 
 def artifact_list(area_id: str | None = None) -> list[dict[str, str | int]]:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     files = []
     area_dirs = [ARTIFACTS_DIR / area_id] if area_id else sorted(
         path for path in ARTIFACTS_DIR.iterdir() if path.is_dir()
@@ -152,6 +153,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(dict(job))
             return
         if parsed.path == "/api/areas":
+            ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
             areas = []
             for area_dir in sorted((path for path in ARTIFACTS_DIR.iterdir() if path.is_dir()), reverse=True):
                 metadata = area_metadata(area_dir)

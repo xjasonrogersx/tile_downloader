@@ -278,18 +278,20 @@ def traverse_for_leaf_glbs(node: dict, target_ecef: tuple[float, float, float], 
     return matches
 
 
-def download_sample_tiles(index: int, lat: float, lon: float, center_height: float, root_tileset: dict, root_url: str, workers: int) -> tuple[int, list[bytes]]:
+def download_sample_tiles(index: int, lat: float, lon: float, center_height: float, root_tileset: dict, root_url: str, workers: int) -> tuple[int, list[bytes], float]:
+    started_at = time.perf_counter()
     sample_glbs = []
     for height_offset in HEIGHT_PROBE_OFFSETS:
         target_ecef = latlon_to_ecef(lat, lon, center_height + height_offset)
         sample_glbs.extend(traverse_for_leaf_glbs(root_tileset["root"], target_ecef, API_KEY, root_url))
-    return index, sample_glbs
+    return index, sample_glbs, time.perf_counter() - started_at
 
 
 # ==========================================
 # 3. Execution & Mesh Stitching
 # ==========================================
 def main(workers: int):
+    download_started_at = time.perf_counter()
     os.makedirs(PARTS_PATH, exist_ok=True)
     for filename in os.listdir(PARTS_PATH):
         if filename.startswith("tile_") and filename.endswith(".glb"):
@@ -316,9 +318,9 @@ def main(workers: int):
     ]
     with ThreadPoolExecutor(max_workers=workers) as executor:
         sample_results = executor.map(lambda args: download_sample_tiles(*args), sample_args)
-        for idx, sample_glbs in sample_results:
+        for idx, sample_glbs, sample_seconds in sample_results:
             lat, lon = grid_points[idx - 1]
-            print(f"[{idx}/{len(grid_points)}] Traversing tile for Lat: {lat:.6f}, Lon: {lon:.6f}...")
+            print(f"[{idx}/{len(grid_points)}] Tile traversal for Lat: {lat:.6f}, Lon: {lon:.6f} took {sample_seconds:.2f}s.")
 
         if sample_glbs:
             new_tiles = 0
@@ -345,8 +347,12 @@ def main(workers: int):
         return
 
     print(f"\nMerging {downloaded_tiles} unique tiles while preserving glTF node transforms...")
+    merge_started_at = time.perf_counter()
     merge_gltf(Path(PARTS_PATH), Path(OUTPUT_PATH))
+    merge_seconds = time.perf_counter() - merge_started_at
+    total_seconds = time.perf_counter() - download_started_at
     print(f"Successfully saved combined street GLTF to: {OUTPUT_PATH}")
+    print(f"Merge took {merge_seconds:.2f}s; total download and merge took {total_seconds:.2f}s.")
 
     # Display preview window
     #merged_scene.show()
@@ -366,12 +372,11 @@ if __name__ == "__main__":
     RADIUS_METERS = args.radius_meters
     GRID_STEPS = args.grid_steps
     ARTIFACTS_DIR = args.artifact_dir.resolve()
+    OUTPUT_PATH = str(ARTIFACTS_DIR / "stitched.gltf")
+    PARTS_PATH = str(ARTIFACTS_DIR / "parts")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     with (BASE_DIR / "log.txt").open("a", encoding="utf-8") as log_file:
         tee = OutputTee(sys.__stdout__, log_file)
         with redirect_stdout(tee), redirect_stderr(tee):
             main(args.workers)
-    OUTPUT_PATH = str(ARTIFACTS_DIR / "stitched.gltf")
-    PARTS_PATH = str(ARTIFACTS_DIR / "parts")
-    main()
