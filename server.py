@@ -37,8 +37,8 @@ def write_log(message: str) -> None:
 
 
 def estimate_region(radius_meters: float) -> dict[str, int]:
-    # The downloader samples about every 30 m, matching its current 7x7 default area.
-    grid_steps = max(3, min(31, math.ceil((radius_meters * 2) / 30) + 1))
+    # Keep samples close enough to catch narrow roads and tile footprints.
+    grid_steps = max(3, min(101, math.ceil((radius_meters * 2) / 15) + 1))
     return {"grid_steps": grid_steps, "samples": grid_steps * grid_steps}
 
 
@@ -100,7 +100,6 @@ def run_download(latitude: float, longitude: float, radius_meters: float, grid_s
             download_process = process
         assert process.stdout is not None
         for line in process.stdout:
-            write_log(f"download: {line.rstrip()}")
             with job_lock:
                 if job["id"] == job_id:
                     match = re.search(r"\[(\d+)/(\d+)\]", line)

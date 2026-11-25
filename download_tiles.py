@@ -1,9 +1,13 @@
 import io
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
 import struct
+import sys
+import time
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import numpy as np
@@ -28,6 +32,23 @@ TARGET_GEOMETRIC_ERROR = 2.006368774808128
 CENTER_LAT = 51.7451423
 CENTER_LON = -0.466216
 HEIGHT = 162.0
+ELEVATION_API_URL = "https://api.open-meteo.com/v1/forecast"
+HEIGHT_PROBE_OFFSETS = (-50.0, 0.0, 25.0, 50.0, 75.0, 100.0, 150.0)
+
+
+class OutputTee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+            stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
 
 # Sampling Grid Parameters
 GRID_STEPS = 7       # 7x7 grid gives enough samples to cover the requested area
@@ -65,6 +86,24 @@ def generate_grid_coords(lat: float, lon: float, radius_m: float, steps: int):
         for r_val in lons:
             coords.append((float(l_val), float(r_val)))
     return coords
+
+
+def fetch_center_height(lat: float, lon: float) -> float:
+    """Fetch the center point elevation, falling back when the service is unavailable."""
+    try:
+        response = requests.get(
+            ELEVATION_API_URL,
+            params={"latitude": lat, "longitude": lon, "current": "temperature_2m"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        elevation = response.json().get("elevation")
+        if elevation is None:
+            raise ValueError("Elevation was missing from the API response")
+        return float(elevation)
+    except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Warning: could not fetch center elevation ({exc}); using fallback height {HEIGHT:.1f} m.")
+        return HEIGHT
 
 
 def is_point_in_box(point: tuple[float, float, float], box: list[float]) -> bool:
@@ -109,14 +148,25 @@ def build_tile_url(uri: str, api_key: str, parent_url: str | None = None) -> str
 
 
 def fetch_tile_or_json(url: str) -> tuple[str, dict | bytes]:
-    resp = requests.get(url)
-    resp.raise_for_status()
-    content_type = resp.headers.get("Content-Type", "").lower()
-    content = resp.content
+    last_error = None
+    for attempt in range(4):
+        try:
+            resp = requests.get(url, timeout=(10, 60))
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "").lower()
+            content = resp.content
 
-    if "application/json" in content_type or content.startswith(b"{"):
-        return "json", resp.json()
-    return "glb", content
+            if "application/json" in content_type or content.startswith(b"{"):
+                return "json", resp.json()
+            return "glb", content
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == 3:
+                break
+            delay = 2 ** attempt
+            print(f"Warning: tile request failed ({exc}); retrying in {delay}s.")
+            time.sleep(delay)
+    raise requests.RequestException(f"Tile request failed after 4 attempts: {last_error}")
 
 
 def load_textured_scene(glb_bytes: bytes) -> trimesh.Scene:
@@ -177,7 +227,11 @@ def traverse_for_leaf_glb(node: dict, target_ecef: tuple[float, float, float], a
             continue
 
         url = build_tile_url(uri, api_key, parent_url)
-        data_type, data = fetch_tile_or_json(url)
+        try:
+            data_type, data = fetch_tile_or_json(url)
+        except requests.RequestException as exc:
+            print(f"Warning: skipping unavailable tile content: {exc}")
+            continue
 
         if data_type == "json":
             result = traverse_for_leaf_glb(data["root"], target_ecef, api_key, url, depth + 1)
@@ -190,10 +244,52 @@ def traverse_for_leaf_glb(node: dict, target_ecef: tuple[float, float, float], a
     return None
 
 
+def traverse_for_leaf_glbs(node: dict, target_ecef: tuple[float, float, float], api_key: str, parent_url: str, depth: int = 0) -> list[bytes]:
+    """Collect every matching street-level GLB in intersecting hierarchy branches."""
+    bounding_box = node.get("boundingVolume", {}).get("box")
+    if bounding_box and not is_point_in_box(target_ecef, bounding_box):
+        return []
+
+    matches = []
+    for child in node.get("children", []):
+        matches.extend(traverse_for_leaf_glbs(child, target_ecef, api_key, parent_url, depth + 1))
+
+    contents = []
+    if "content" in node:
+        contents.append(node["content"])
+    if "contents" in node:
+        contents.extend(node["contents"])
+
+    for item in contents:
+        uri = item.get("uri") or item.get("url")
+        if not uri:
+            continue
+        url = build_tile_url(uri, api_key, parent_url)
+        try:
+            data_type, data = fetch_tile_or_json(url)
+        except requests.RequestException as exc:
+            print(f"Warning: skipping unavailable tile content: {exc}")
+            continue
+        if data_type == "json":
+            matches.extend(traverse_for_leaf_glbs(data["root"], target_ecef, api_key, url, depth + 1))
+        elif math.isclose(node.get("geometricError", float("inf")), TARGET_GEOMETRIC_ERROR, abs_tol=1e-6):
+            matches.append(data)
+
+    return matches
+
+
+def download_sample_tiles(index: int, lat: float, lon: float, center_height: float, root_tileset: dict, root_url: str, workers: int) -> tuple[int, list[bytes]]:
+    sample_glbs = []
+    for height_offset in HEIGHT_PROBE_OFFSETS:
+        target_ecef = latlon_to_ecef(lat, lon, center_height + height_offset)
+        sample_glbs.extend(traverse_for_leaf_glbs(root_tileset["root"], target_ecef, API_KEY, root_url))
+    return index, sample_glbs
+
+
 # ==========================================
 # 3. Execution & Mesh Stitching
 # ==========================================
-def main():
+def main(workers: int):
     os.makedirs(PARTS_PATH, exist_ok=True)
     for filename in os.listdir(PARTS_PATH):
         if filename.startswith("tile_") and filename.endswith(".glb"):
@@ -206,30 +302,41 @@ def main():
     _, root_tileset = fetch_tile_or_json(root_url)
 
     grid_points = generate_grid_coords(CENTER_LAT, CENTER_LON, RADIUS_METERS, GRID_STEPS)
+    center_height = fetch_center_height(CENTER_LAT, CENTER_LON)
+    print(f"Using center elevation {center_height:.1f} m as the tile sampling height.")
     print(f"Sampling {len(grid_points)} grid points over a {RADIUS_METERS * 2}m x {RADIUS_METERS * 2}m area...")
 
     unique_glbs = set()
     downloaded_tiles = 0
 
-    for idx, (lat, lon) in enumerate(grid_points, start=1):
-        target_ecef = latlon_to_ecef(lat, lon, HEIGHT)
-        print(f"[{idx}/{len(grid_points)}] Traversing tile for Lat: {lat:.6f}, Lon: {lon:.6f}...")
+    print(f"Using {workers} concurrent download workers.")
+    sample_args = [
+        (idx, lat, lon, center_height, root_tileset, root_url, workers)
+        for idx, (lat, lon) in enumerate(grid_points, start=1)
+    ]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        sample_results = executor.map(lambda args: download_sample_tiles(*args), sample_args)
+        for idx, sample_glbs in sample_results:
+            lat, lon = grid_points[idx - 1]
+            print(f"[{idx}/{len(grid_points)}] Traversing tile for Lat: {lat:.6f}, Lon: {lon:.6f}...")
 
-        glb_bytes = traverse_for_leaf_glb(root_tileset["root"], target_ecef, API_KEY, root_url)
-
-        if glb_bytes:
+        if sample_glbs:
+            new_tiles = 0
             # Hash GLB content to avoid adding duplicates
-            glb_hash = hash(glb_bytes)
-            if glb_hash not in unique_glbs:
+            for glb_bytes in sample_glbs:
+                glb_hash = hash(glb_bytes)
+                if glb_hash in unique_glbs:
+                    continue
                 unique_glbs.add(glb_hash)
                 os.makedirs(PARTS_PATH, exist_ok=True)
                 part_path = os.path.join(PARTS_PATH, f"tile_{downloaded_tiles + 1:03d}.glb")
                 with open(part_path, "wb") as part_file:
                     part_file.write(glb_bytes)
                 downloaded_tiles += 1
+                new_tiles += 1
                 print(f"  -> Downloaded new unique tile mesh ({len(glb_bytes) // 1024} KB) to {part_path}")
-            else:
-                print("  -> Duplicate tile returned; skipping.")
+            if not new_tiles:
+                print("  -> All matching tiles were already downloaded.")
         else:
             print("  -> No leaf tile found for this point.")
 
@@ -251,6 +358,7 @@ if __name__ == "__main__":
     parser.add_argument("--longitude", type=float, default=CENTER_LON)
     parser.add_argument("--radius-meters", type=float, default=RADIUS_METERS)
     parser.add_argument("--grid-steps", type=int, default=GRID_STEPS)
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent grid-point download workers.")
     parser.add_argument("--artifact-dir", type=Path, default=ARTIFACTS_DIR)
     args = parser.parse_args()
     CENTER_LAT = args.latitude
@@ -258,6 +366,12 @@ if __name__ == "__main__":
     RADIUS_METERS = args.radius_meters
     GRID_STEPS = args.grid_steps
     ARTIFACTS_DIR = args.artifact_dir.resolve()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    with (BASE_DIR / "log.txt").open("a", encoding="utf-8") as log_file:
+        tee = OutputTee(sys.__stdout__, log_file)
+        with redirect_stdout(tee), redirect_stderr(tee):
+            main(args.workers)
     OUTPUT_PATH = str(ARTIFACTS_DIR / "stitched.gltf")
     PARTS_PATH = str(ARTIFACTS_DIR / "parts")
     main()
