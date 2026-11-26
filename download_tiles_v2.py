@@ -14,41 +14,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from download_tiles import (
+from tiles_common import (
     API_KEY,
     ARTIFACTS_DIR,
     BASE_DIR,
     CENTER_LAT,
     CENTER_LON,
-    ELEVATION_API_URL,
-    HEIGHT,
-    OUTPUT_PATH,
-    PARTS_PATH,
     build_tile_url,
     fetch_center_height,
     fetch_tile_or_json,
     latlon_to_ecef,
     merge_gltf,
+    OutputTee,
     traverse_for_leaf_glbs,
 )
 
 CAMERA_EYE_OFFSET = 30.0
-SURFACE_HEIGHT_OFFSETS = (-50.0, 0.0, 25.0, 50.0, 75.0, 100.0, 150.0)
-
-
-class OutputTee:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, text: str) -> int:
-        for stream in self.streams:
-            stream.write(text)
-            stream.flush()
-        return len(text)
-
-    def flush(self) -> None:
-        for stream in self.streams:
-            stream.flush()
+# Concentrated around observed +35m..+55m hit band with a small buffer on both sides
+SURFACE_HEIGHT_OFFSETS = (30.0, 38.0, 44.0, 48.0, 52.0, 56.0, 62.0, 70.0)
 
 
 def setup_debug_logger(debug_log_path: Path) -> logging.Logger:
@@ -74,60 +57,48 @@ def log(msg: str) -> None:
 
 def offset_latlon(lat: float, lon: float, east_m: float, north_m: float) -> tuple[float, float]:
     lat_delta = north_m / 111320.0
-    lon_delta = east_m / (111320.0 * math.cos(math.radians(lat)))
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    lon_delta = east_m / (111320.0 * cos_lat)
     return lat + lat_delta, lon + lon_delta
+
+
+def linear_axis(span_half_m: float, count: int) -> list[float]:
+    if count <= 1:
+        return [0.0]
+    return [-span_half_m + (2.0 * span_half_m * i / (count - 1)) for i in range(count)]
 
 
 def surface_targets(
     lat: float,
     lon: float,
     terrain_height: float,
-    footprint_half_m: float,
-) -> list[tuple[float, float, float]]:
-    targets: list[tuple[float, float, float]] = []
-
-    ground_offsets = (
-        -footprint_half_m,
-        -0.5 * footprint_half_m,
-        0.0,
-        0.5 * footprint_half_m,
-        footprint_half_m,
-    )
-    for north_m in ground_offsets:
-        for east_m in ground_offsets:
-            target_lat, target_lon = offset_latlon(lat, lon, east_m, north_m)
-            for height_offset in SURFACE_HEIGHT_OFFSETS:
-                targets.append((target_lat, target_lon, terrain_height + height_offset))
-
+    span_half_m: float,
+    samples_per_axis: int = 7,
+) -> list[tuple[float, float, float, float]]:
+    """Return deterministic (lat, lon, height, h_offset) samples over [-span_half_m, +span_half_m]."""
+    offsets = linear_axis(span_half_m, samples_per_axis)
+    targets: list[tuple[float, float, float, float]] = []
+    for north_m in offsets:
+        for east_m in offsets:
+            t_lat, t_lon = offset_latlon(lat, lon, east_m, north_m)
+            for h_off in SURFACE_HEIGHT_OFFSETS:
+                targets.append((t_lat, t_lon, terrain_height + h_off, h_off))
     return targets
 
 
-def camera_viewpoints(lat: float, lon: float, radius_m: float, steps: int, center_height: float):
-    viewpoints = []
+def camera_viewpoints(
+    lat: float, lon: float, radius_m: float, steps: int, center_height: float
+) -> list[tuple[int, float, float, float]]:
+    coords = linear_axis(radius_m, steps)
     camera_height = center_height + CAMERA_EYE_OFFSET
+    viewpoints = []
     idx = 1
-
-    for north_m in (-radius_m + (2 * radius_m * i / max(1, steps - 1)) for i in range(steps)):
-        for east_m in (-radius_m + (2 * radius_m * i / max(1, steps - 1)) for i in range(steps)):
-            viewpoint_lat, viewpoint_lon = offset_latlon(lat, lon, east_m, north_m)
-            viewpoints.append((idx, viewpoint_lat, viewpoint_lon, camera_height))
+    for north_m in coords:
+        for east_m in coords:
+            vp_lat, vp_lon = offset_latlon(lat, lon, east_m, north_m)
+            viewpoints.append((idx, vp_lat, vp_lon, camera_height))
             idx += 1
-
     return viewpoints
-
-
-def summarize_targets(targets: list[tuple[float, float, float]]) -> str:
-    if not targets:
-        return "count=0"
-    lats = [t[0] for t in targets]
-    lons = [t[1] for t in targets]
-    heights = [t[2] for t in targets]
-    return (
-        f"count={len(targets)} "
-        f"lat=[{min(lats):.6f}, {max(lats):.6f}] "
-        f"lon=[{min(lons):.6f}, {max(lons):.6f}] "
-        f"h=[{min(heights):.1f}m, {max(heights):.1f}m]"
-    )
 
 
 def download_camera_viewpoint(
@@ -135,43 +106,40 @@ def download_camera_viewpoint(
     root_tileset: dict,
     root_url: str,
     terrain_height: float,
-    footprint_half_m: float,
+    span_half_m: float,
+    samples_per_axis: int,
     dbg: logging.Logger,
 ):
-    index, lat, lon, camera_height = viewpoint
+    index, lat, lon, _ = viewpoint
     started_at = time.perf_counter()
     unique_matches: dict[bytes, bytes] = {}
+    hit_offsets: set[float] = set()
     raw_match_count = 0
     error_count = 0
 
-    targets = surface_targets(lat, lon, terrain_height, footprint_half_m)
-    dbg.debug(
-        "VP %d start lat=%.6f lon=%.6f cam_h=%.1f terrain_h=%.1f %s",
-        index,
-        lat,
-        lon,
-        camera_height,
-        terrain_height,
-        summarize_targets(targets),
-    )
-
-    for sample_idx, (target_lat, target_lon, target_height) in enumerate(targets):
+    targets = surface_targets(lat, lon, terrain_height, span_half_m, samples_per_axis)
+    for sample_idx, (t_lat, t_lon, t_h, h_off) in enumerate(targets):
         try:
-            target_ecef = latlon_to_ecef(target_lat, target_lon, target_height)
-            leaf_glbs = traverse_for_leaf_glbs(root_tileset["root"], target_ecef, API_KEY, root_url)
+            target_ecef = latlon_to_ecef(t_lat, t_lon, t_h)
+            leaf_glbs = traverse_for_leaf_glbs(
+                root_tileset["root"], target_ecef, API_KEY, root_url
+            )
         except Exception as exc:
             error_count += 1
             dbg.error(
-                "VP %d sample=%d target=(%.6f, %.6f, %.1f) traversal error: %s\n%s",
+                "VP %d sample=%d target=(%.6f, %.6f, %.1f) error: %s\n%s",
                 index,
                 sample_idx,
-                target_lat,
-                target_lon,
-                target_height,
+                t_lat,
+                t_lon,
+                t_h,
                 exc,
                 traceback.format_exc(),
             )
             continue
+
+        if leaf_glbs:
+            hit_offsets.add(h_off)
 
         for glb_bytes in leaf_glbs:
             raw_match_count += 1
@@ -181,23 +149,16 @@ def download_camera_viewpoint(
 
     elapsed = time.perf_counter() - started_at
     dbg.info(
-        "VP %d done in %.2fs: raw_hits=%d unique_in_vp=%d errors=%d",
+        "VP %d done in %.2fs: targets=%d raw_hits=%d unique_in_vp=%d hit_h_offs=%s errors=%d",
         index,
         elapsed,
-        raw_match_count,
-        len(unique_matches),
-        error_count,
-    )
-    return (
-        index,
-        lat,
-        lon,
-        unique_matches,
         len(targets),
         raw_match_count,
+        len(unique_matches),
+        sorted(hit_offsets),
         error_count,
-        elapsed,
     )
+    return index, lat, lon, unique_matches, len(targets), raw_match_count, error_count, elapsed
 
 
 def main(
@@ -206,25 +167,15 @@ def main(
     longitude: float,
     radius_meters: float,
     grid_steps: int,
+    samples_per_axis: int,
     artifact_dir: Path,
 ):
-    global OUTPUT_PATH, PARTS_PATH
     started_at = time.perf_counter()
     output_path = artifact_dir / "stitched.gltf"
     parts_path = artifact_dir / "parts"
     debug_log_path = artifact_dir / "debug.log"
     parts_path.mkdir(parents=True, exist_ok=True)
     dbg = setup_debug_logger(debug_log_path)
-
-    dbg.info(
-        "Starting sweep: lat=%.6f lon=%.6f radius_m=%.1f grid_steps=%d workers=%d artifact_dir=%s",
-        latitude,
-        longitude,
-        radius_meters,
-        grid_steps,
-        workers,
-        artifact_dir,
-    )
 
     for filename in os.listdir(parts_path):
         if filename.startswith("tile_") and filename.endswith(".glb"):
@@ -236,39 +187,22 @@ def main(
     log(f"Debug log path: {debug_log_path}")
     log("Fetching root tileset and terrain elevation...")
     root_url = build_tile_url("root.json", API_KEY)
-    try:
-        _, root_tileset = fetch_tile_or_json(root_url)
-        center_height = fetch_center_height(latitude, longitude)
-    except Exception as exc:
-        dbg.critical("Failed fetching root tileset or center elevation: %s\n%s", exc, traceback.format_exc())
-        raise
-
-    dbg.info(
-        "Root keys=%s center_height=%.2f camera_height=%.2f",
-        list(root_tileset.keys()) if isinstance(root_tileset, dict) else type(root_tileset),
-        center_height,
-        center_height + CAMERA_EYE_OFFSET,
-    )
+    _, root_tileset = fetch_tile_or_json(root_url)
+    center_height = fetch_center_height(latitude, longitude)
 
     viewpoints = camera_viewpoints(latitude, longitude, radius_meters, grid_steps, center_height)
-    footprint_half_m = radius_meters / max(1, grid_steps - 1)
-    dbg.info("Generated %d viewpoints; footprint_half_m=%.2f", len(viewpoints), footprint_half_m)
+    cell_spacing = (2.0 * radius_meters / max(1, grid_steps - 1)) if grid_steps > 1 else radius_meters
+    span_half_m = cell_spacing * 0.675
 
     log(
-        f"Using camera elevation {center_height + CAMERA_EYE_OFFSET:.1f} m "
-        f"({center_height:.1f} m terrain + {CAMERA_EYE_OFFSET:.1f} m eye offset)."
+        f"Sweep: {len(viewpoints)} viewpoints, {samples_per_axis}x{samples_per_axis}x"
+        f"{len(SURFACE_HEIGHT_OFFSETS)} samples each, {workers} workers."
     )
-    log(
-        f"Surface sweep: {len(viewpoints)} moving viewpoints, local footprint half-width "
-        f"{footprint_half_m:.1f} m, and {len(SURFACE_HEIGHT_OFFSETS)} height bands."
-    )
-    log(f"Using {workers} concurrent camera workers.")
 
     seen_hashes: set[bytes] = set()
     downloaded_tiles = 0
     total_raw_matches = 0
     total_ray_errors = 0
-    zero_new_viewpoints: list[int] = []
     completed = 0
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -279,32 +213,20 @@ def main(
                 root_tileset,
                 root_url,
                 center_height,
-                footprint_half_m,
+                span_half_m,
+                samples_per_axis,
                 dbg,
             )
             for point in viewpoints
         ]
         for future in as_completed(futures):
             completed += 1
-            try:
-                (
-                    index,
-                    lat,
-                    lon,
-                    matches_by_hash,
-                    ray_count,
-                    raw_match_count,
-                    error_count,
-                    elapsed,
-                ) = future.result()
-            except Exception as exc:
-                total_ray_errors += 1
-                dbg.error("Future failed: %s\n%s", exc, traceback.format_exc())
-                log(f"[{completed}/{len(viewpoints)}] Worker raised an exception (see debug.log): {exc}")
-                continue
-
+            index, lat, lon, matches_by_hash, sample_count, raw_match_count, error_count, elapsed = (
+                future.result()
+            )
             total_raw_matches += raw_match_count
             total_ray_errors += error_count
+
             new_tiles = 0
             for digest, glb_bytes in matches_by_hash.items():
                 if digest in seen_hashes:
@@ -314,52 +236,24 @@ def main(
                 part_path.write_bytes(glb_bytes)
                 downloaded_tiles += 1
                 new_tiles += 1
-                dbg.debug(
-                    "Saved tile %s sha256=%s bytes=%d from VP %d",
-                    part_path.name,
-                    digest.hex()[:16],
-                    len(glb_bytes),
-                    index,
-                )
-
-            if new_tiles == 0:
-                zero_new_viewpoints.append(index)
 
             log(
-                f"[{completed}/{len(viewpoints)}] Viewpoint {index} "
-                f"({lat:.6f}, {lon:.6f}) tested {ray_count} points in {elapsed:.2f}s "
-                f"-> {new_tiles} new unique tiles ({downloaded_tiles} total)."
+                f"[{completed}/{len(viewpoints)}] VP {index} ({lat:.6f}, {lon:.6f}) "
+                f"{sample_count} samples in {elapsed:.2f}s -> +{new_tiles} tiles ({downloaded_tiles} total)."
             )
 
-    dbg.info(
-        "Sweep complete: viewpoints=%d raw_matches=%d unique_tiles=%d ray_errors=%d zero_new_vps=%s",
-        len(viewpoints),
-        total_raw_matches,
-        downloaded_tiles,
-        total_ray_errors,
-        zero_new_viewpoints,
-    )
-
     if not downloaded_tiles:
-        dbg.error("No GLB tiles were fetched.")
         log("Error: No GLB tiles were fetched.")
         return
 
-    log(f"\nMerging {downloaded_tiles} unique tiles while preserving glTF node transforms...")
+    log(f"\nMerging {downloaded_tiles} unique tiles...")
     merge_started_at = time.perf_counter()
-    try:
-        merge_gltf(parts_path, output_path)
-    except Exception as exc:
-        dbg.critical("merge_gltf failed: %s\n%s", exc, traceback.format_exc())
-        raise
-
+    merge_gltf(parts_path, output_path)
     merge_elapsed = time.perf_counter() - merge_started_at
     total_elapsed = time.perf_counter() - started_at
-    dbg.info("Merge succeeded in %.2fs -> %s (total %.2fs)", merge_elapsed, output_path, total_elapsed)
-    log(f"Successfully saved combined street GLTF to: {output_path}")
     log(
-        f"Merge took {merge_elapsed:.2f}s; "
-        f"total camera download and merge took {total_elapsed:.2f}s."
+        f"Saved {output_path} (merge: {merge_elapsed:.2f}s, total: {total_elapsed:.2f}s, "
+        f"raw_hits: {total_raw_matches}, errors: {total_ray_errors})."
     )
 
 
@@ -370,12 +264,13 @@ if __name__ == "__main__":
     parser.add_argument("--latitude", type=float, default=CENTER_LAT)
     parser.add_argument("--longitude", type=float, default=CENTER_LON)
     parser.add_argument("--radius-meters", type=float, default=100.0)
-    parser.add_argument("--grid-steps", type=int, default=3, help="Camera viewpoints per axis.")
+    parser.add_argument("--grid-steps", type=int, default=8)
+    parser.add_argument("--samples-per-axis", type=int, default=6)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--artifact-dir", type=Path, default=ARTIFACTS_DIR)
     args = parser.parse_args()
-    if args.workers < 1 or args.grid_steps < 1:
-        parser.error("--workers and --grid-steps must be at least 1")
+    if args.workers < 1 or args.grid_steps < 1 or args.samples_per_axis < 1:
+        parser.error("--workers, --grid-steps, and --samples-per-axis must be at least 1")
     artifact_dir = args.artifact_dir.resolve()
     with (BASE_DIR / "log.txt").open("a", encoding="utf-8") as log_file:
         tee = OutputTee(sys.__stdout__, log_file)
@@ -386,5 +281,6 @@ if __name__ == "__main__":
                 args.longitude,
                 args.radius_meters,
                 args.grid_steps,
+                args.samples_per_axis,
                 artifact_dir,
             )
