@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import threading
@@ -12,23 +13,103 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 
 from merge_gltf import merge_gltf
 
 BASE_DIR = Path(__file__).resolve().parent
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
+GLOBAL_TILES_DIR = ARTIFACTS_DIR / "tiles"
 TOKEN_PATH = BASE_DIR / "token.txt"
-API_KEY = TOKEN_PATH.read_text(encoding="utf-8").strip() if TOKEN_PATH.exists() else os.getenv("GOOGLE_3D_TILES_API_KEY", "")
+API_KEY = (
+    TOKEN_PATH.read_text(encoding="utf-8").strip()
+    if TOKEN_PATH.exists()
+    else os.getenv("GOOGLE_3D_TILES_API_KEY", "")
+)
 OUTPUT_PATH = str(ARTIFACTS_DIR / "stitched.gltf")
-PARTS_PATH = str(ARTIFACTS_DIR / "parts")
 TARGET_GEOMETRIC_ERROR = 2.006368774808128
 CENTER_LAT = 51.7451423
 CENTER_LON = -0.466216
 HEIGHT = 162.0
 ELEVATION_API_URL = "https://api.open-meteo.com/v1/forecast"
 HEIGHT_PROBE_OFFSETS = (-50.0, 0.0, 25.0, 50.0, 75.0, 100.0, 150.0)
+
 FETCH_CACHE: dict[str, tuple[str, dict | bytes]] = {}
 FETCH_CACHE_LOCK = threading.Lock()
+_STATS_LOCK = threading.Lock()
+_FETCH_STATS = {
+    "network_requests": 0,
+    "cache_hits": 0,
+    "json_fetches": 0,
+    "glb_fetches": 0,
+}
+
+_SESSION_LOCK = threading.Lock()
+_HTTP_SESSION: requests.Session | None = None
+
+
+def tile_hash(glb_bytes: bytes) -> str:
+    return hashlib.sha256(glb_bytes).hexdigest()
+
+
+def tile_cache_path(content_hash: str, cache_dir: Path = GLOBAL_TILES_DIR) -> Path:
+    if len(content_hash) != 64 or any(character not in "0123456789abcdef" for character in content_hash):
+        raise ValueError(f"Invalid tile hash: {content_hash}")
+    return cache_dir / f"{content_hash}.glb"
+
+
+def store_tile(glb_bytes: bytes, cache_dir: Path = GLOBAL_TILES_DIR) -> str:
+    """Store a GLB once in the shared cache and return its SHA-256 hash."""
+    content_hash = tile_hash(glb_bytes)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    destination = tile_cache_path(content_hash, cache_dir)
+    if destination.exists():
+        return content_hash
+
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_bytes(glb_bytes)
+        os.replace(temporary, destination)
+    except FileExistsError:
+        pass
+    finally:
+        temporary.unlink(missing_ok=True)
+    return content_hash
+
+
+def tile_paths_from_metadata(metadata_path: Path, cache_dir: Path = GLOBAL_TILES_DIR) -> list[Path]:
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    hashes = metadata.get("tile_hashes")
+    if not isinstance(hashes, list) or not hashes:
+        raise ValueError(f"{metadata_path}: metadata.json has no tile_hashes")
+    paths = [tile_cache_path(str(content_hash), cache_dir) for content_hash in hashes]
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing cached tile: {missing[0]}")
+    return paths
+
+
+def _get_session(pool_size: int = 32) -> requests.Session:
+    global _HTTP_SESSION
+    with _SESSION_LOCK:
+        if _HTTP_SESSION is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _HTTP_SESSION = session
+        return _HTTP_SESSION
+
+
+def reset_fetch_stats() -> None:
+    with _STATS_LOCK:
+        for key in _FETCH_STATS:
+            _FETCH_STATS[key] = 0
+
+
+def get_fetch_stats() -> dict[str, int]:
+    with _STATS_LOCK:
+        return dict(_FETCH_STATS)
 
 
 class OutputTee:
@@ -62,7 +143,7 @@ def latlon_to_ecef(lat: float, lon: float, height: float) -> tuple[float, float,
 def fetch_center_height(lat: float, lon: float) -> float:
     """Fetch center elevation, falling back when the service is unavailable."""
     try:
-        response = requests.get(
+        response = _get_session().get(
             ELEVATION_API_URL,
             params={"latitude": lat, "longitude": lon, "current": "temperature_2m"},
             timeout=10,
@@ -73,7 +154,9 @@ def fetch_center_height(lat: float, lon: float) -> float:
             raise ValueError("Elevation was missing from the API response")
         return float(elevation)
     except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError) as exc:
-        print(f"Warning: could not fetch center elevation ({exc}); using fallback height {HEIGHT:.1f} m.")
+        print(
+            f"Warning: could not fetch center elevation ({exc}); using fallback height {HEIGHT:.1f} m."
+        )
         return HEIGHT
 
 
@@ -83,7 +166,9 @@ def is_point_in_box(point: tuple[float, float, float], box: list[float]) -> bool
     axes = np.asarray([box[3:6], box[6:9], box[9:12]], dtype=float).T
     if abs(np.linalg.det(axes)) < 1e-9:
         return False
-    local_pos = np.linalg.solve(axes, np.asarray(point, dtype=float) - np.asarray(center, dtype=float))
+    local_pos = np.linalg.solve(
+        axes, np.asarray(point, dtype=float) - np.asarray(center, dtype=float)
+    )
     return bool(np.all(np.abs(local_pos) <= 1.0 + 1e-9))
 
 
@@ -96,7 +181,11 @@ def build_tile_url(uri: str, api_key: str, parent_url: str | None = None) -> str
         base_url = f"{parsed_parent.scheme}://{parsed_parent.netloc}{uri}"
     elif not uri.startswith("http"):
         uri = uri.lstrip("/")
-        base_url = f"https://tile.googleapis.com/v1/3dtiles/{uri}" if not uri.startswith("v1/") else f"https://tile.googleapis.com/{uri}"
+        base_url = (
+            f"https://tile.googleapis.com/v1/3dtiles/{uri}"
+            if not uri.startswith("v1/")
+            else f"https://tile.googleapis.com/{uri}"
+        )
     else:
         base_url = uri
 
@@ -107,25 +196,47 @@ def build_tile_url(uri: str, api_key: str, parent_url: str | None = None) -> str
         if "session" in parent_query and "session" not in query_params:
             query_params["session"] = parent_query["session"]
     query_params["key"] = [api_key]
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query_params, doseq=True), parsed.fragment))
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query_params, doseq=True),
+            parsed.fragment,
+        )
+    )
 
 
 def fetch_tile_or_json(url: str) -> tuple[str, dict | bytes]:
     with FETCH_CACHE_LOCK:
         cached = FETCH_CACHE.get(url)
     if cached is not None:
+        with _STATS_LOCK:
+            _FETCH_STATS["cache_hits"] += 1
         return cached
 
+    session = _get_session()
     last_error = None
     for attempt in range(4):
         try:
-            response = requests.get(url, timeout=(10, 60))
+            with _STATS_LOCK:
+                _FETCH_STATS["network_requests"] += 1
+            response = session.get(url, timeout=(10, 60))
             response.raise_for_status()
             content = response.content
-            if "application/json" in response.headers.get("Content-Type", "").lower() or content.startswith(b"{"):
+            is_json = (
+                "application/json" in response.headers.get("Content-Type", "").lower()
+                or content.startswith(b"{")
+            )
+            if is_json:
                 result = ("json", response.json())
+                with _STATS_LOCK:
+                    _FETCH_STATS["json_fetches"] += 1
             else:
                 result = ("glb", content)
+                with _STATS_LOCK:
+                    _FETCH_STATS["glb_fetches"] += 1
             with FETCH_CACHE_LOCK:
                 FETCH_CACHE[url] = result
             return result
@@ -133,7 +244,7 @@ def fetch_tile_or_json(url: str) -> tuple[str, dict | bytes]:
             last_error = exc
             if attempt == 3:
                 break
-            delay = 2 ** attempt
+            delay = 2**attempt
             print(f"Warning: tile request failed ({exc}); retrying in {delay}s.")
             time.sleep(delay)
     raise requests.RequestException(f"Tile request failed after 4 attempts: {last_error}")
@@ -148,7 +259,13 @@ def _contents(node: dict) -> list[dict]:
     return contents
 
 
-def traverse_for_leaf_glb(node: dict, target_ecef: tuple[float, float, float], api_key: str, parent_url: str, depth: int = 0) -> bytes | None:
+def traverse_for_leaf_glb(
+    node: dict,
+    target_ecef: tuple[float, float, float],
+    api_key: str,
+    parent_url: str,
+    depth: int = 0,
+) -> bytes | None:
     bounding_box = node.get("boundingVolume", {}).get("box")
     if bounding_box and not is_point_in_box(target_ecef, bounding_box):
         return None
@@ -172,12 +289,20 @@ def traverse_for_leaf_glb(node: dict, target_ecef: tuple[float, float, float], a
             result = traverse_for_leaf_glb(data["root"], target_ecef, api_key, url, depth + 1)
             if result:
                 return result
-        elif math.isclose(node.get("geometricError", float("inf")), TARGET_GEOMETRIC_ERROR, abs_tol=1e-6):
+        elif math.isclose(
+            node.get("geometricError", float("inf")), TARGET_GEOMETRIC_ERROR, abs_tol=1e-6
+        ):
             return data
     return None
 
 
-def traverse_for_leaf_glbs(node: dict, target_ecef: tuple[float, float, float], api_key: str, parent_url: str, depth: int = 0) -> list[bytes]:
+def traverse_for_leaf_glbs(
+    node: dict,
+    target_ecef: tuple[float, float, float],
+    api_key: str,
+    parent_url: str,
+    depth: int = 0,
+) -> list[bytes]:
     """Collect every matching street-level GLB in intersecting hierarchy branches."""
     bounding_box = node.get("boundingVolume", {}).get("box")
     if bounding_box and not is_point_in_box(target_ecef, bounding_box):
@@ -185,7 +310,9 @@ def traverse_for_leaf_glbs(node: dict, target_ecef: tuple[float, float, float], 
 
     matches = []
     for child in node.get("children", []):
-        matches.extend(traverse_for_leaf_glbs(child, target_ecef, api_key, parent_url, depth + 1))
+        matches.extend(
+            traverse_for_leaf_glbs(child, target_ecef, api_key, parent_url, depth + 1)
+        )
     for item in _contents(node):
         uri = item.get("uri") or item.get("url")
         if not uri:
@@ -197,7 +324,11 @@ def traverse_for_leaf_glbs(node: dict, target_ecef: tuple[float, float, float], 
             print(f"Warning: skipping unavailable tile content: {exc}")
             continue
         if data_type == "json":
-            matches.extend(traverse_for_leaf_glbs(data["root"], target_ecef, api_key, url, depth + 1))
-        elif math.isclose(node.get("geometricError", float("inf")), TARGET_GEOMETRIC_ERROR, abs_tol=1e-6):
+            matches.extend(
+                traverse_for_leaf_glbs(data["root"], target_ecef, api_key, url, depth + 1)
+            )
+        elif math.isclose(
+            node.get("geometricError", float("inf")), TARGET_GEOMETRIC_ERROR, abs_tol=1e-6
+        ):
             matches.append(data)
     return matches

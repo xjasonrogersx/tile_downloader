@@ -20,12 +20,14 @@ from tiles_common import (
     BASE_DIR,
     CENTER_LAT,
     CENTER_LON,
+    OutputTee,
     build_tile_url,
     fetch_center_height,
     fetch_tile_or_json,
+    get_fetch_stats,
     latlon_to_ecef,
     merge_gltf,
-    OutputTee,
+    reset_fetch_stats,
     traverse_for_leaf_glbs,
 )
 
@@ -170,6 +172,7 @@ def main(
     samples_per_axis: int,
     artifact_dir: Path,
 ):
+    reset_fetch_stats()
     started_at = time.perf_counter()
     output_path = artifact_dir / "stitched.gltf"
     parts_path = artifact_dir / "parts"
@@ -242,8 +245,9 @@ def main(
                 f"{sample_count} samples in {elapsed:.2f}s -> +{new_tiles} tiles ({downloaded_tiles} total)."
             )
 
+    stats = get_fetch_stats()
     if not downloaded_tiles:
-        log("Error: No GLB tiles were fetched.")
+        log(f"Error: No GLB tiles were fetched. Fetch stats: {stats}")
         return
 
     log(f"\nMerging {downloaded_tiles} unique tiles...")
@@ -251,9 +255,12 @@ def main(
     merge_gltf(parts_path, output_path)
     merge_elapsed = time.perf_counter() - merge_started_at
     total_elapsed = time.perf_counter() - started_at
+    dbg.info("Fetch stats summary: %s", stats)
     log(
         f"Saved {output_path} (merge: {merge_elapsed:.2f}s, total: {total_elapsed:.2f}s, "
-        f"raw_hits: {total_raw_matches}, errors: {total_ray_errors})."
+        f"raw_hits: {total_raw_matches}, errors: {total_ray_errors}, "
+        f"net_reqs: {stats['network_requests']}, cache_hits: {stats['cache_hits']}, "
+        f"json: {stats['json_fetches']}, glb: {stats['glb_fetches']})."
     )
 
 
