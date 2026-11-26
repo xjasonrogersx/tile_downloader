@@ -85,3 +85,26 @@ points, API failures, and merge errors.
 If a road or roof is missing, repeat the download with a larger radius and
 ensure the selected region covers the complete feature. A denser grid can be
 requested from the command line by increasing `--grid-steps`.
+
+## Fill gaps in an existing area
+
+The area viewer shows the merged result, but it cannot identify missing tiles
+automatically. `fill_gaps.py` scans an existing area again using a denser
+geographic grid and the same vertical probes used by the grid downloader. It
+keeps the existing GLBs, adds only new content, and rebuilds the merged model.
+
+Preview the scan size first:
+
+```bash
+python3 fill_gaps.py area-20261125-223411-1dd082 --spacing 20 --dry-run
+```
+
+Run the scan:
+
+```bash
+python3 fill_gaps.py area-20261125-223411-1dd082 --spacing 20 --workers 8
+```
+
+Use a larger spacing such as `40` for a faster broad pass, or a smaller
+spacing such as `10` around a narrow missing road. The area URL then remains
+the same; refresh it after the scan finishes.
