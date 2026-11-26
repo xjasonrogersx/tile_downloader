@@ -15,11 +15,10 @@ import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 
-from merge_gltf import merge_gltf
-
 BASE_DIR = Path(__file__).resolve().parent
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
 GLOBAL_TILES_DIR = ARTIFACTS_DIR / "tiles"
+TILE_URL_INDEX_PATH = GLOBAL_TILES_DIR / "url_index.json"
 TOKEN_PATH = BASE_DIR / "token.txt"
 API_KEY = (
     TOKEN_PATH.read_text(encoding="utf-8").strip()
@@ -46,6 +45,14 @@ _FETCH_STATS = {
 
 _SESSION_LOCK = threading.Lock()
 _HTTP_SESSION: requests.Session | None = None
+_TILE_INDEX_LOCK = threading.Lock()
+_TILE_URL_INDEX: dict[str, str] | None = None
+
+
+def merge_gltf(*args, **kwargs):
+    from merge_gltf import merge_gltf as merge_impl
+
+    return merge_impl(*args, **kwargs)
 
 
 def tile_hash(glb_bytes: bytes) -> str:
@@ -75,6 +82,52 @@ def store_tile(glb_bytes: bytes, cache_dir: Path = GLOBAL_TILES_DIR) -> str:
     finally:
         temporary.unlink(missing_ok=True)
     return content_hash
+
+
+def _tile_url_key(url: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    query.pop("key", None)
+    query.pop("session", None)
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query, doseq=True), "")
+    )
+
+
+def _load_tile_url_index() -> dict[str, str]:
+    global _TILE_URL_INDEX
+    with _TILE_INDEX_LOCK:
+        if _TILE_URL_INDEX is None:
+            if TILE_URL_INDEX_PATH.exists():
+                try:
+                    loaded = json.loads(TILE_URL_INDEX_PATH.read_text(encoding="utf-8"))
+                    _TILE_URL_INDEX = loaded if isinstance(loaded, dict) else {}
+                except (OSError, json.JSONDecodeError):
+                    _TILE_URL_INDEX = {}
+            else:
+                _TILE_URL_INDEX = {}
+        return _TILE_URL_INDEX
+
+
+def cached_tile_for_url(url: str) -> bytes | None:
+    content_hash = _load_tile_url_index().get(_tile_url_key(url))
+    if not content_hash:
+        return None
+    path = tile_cache_path(content_hash)
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def remember_tile_url(url: str, content_hash: str) -> None:
+    index = _load_tile_url_index()
+    with _TILE_INDEX_LOCK:
+        index[_tile_url_key(url)] = content_hash
+        TILE_URL_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = TILE_URL_INDEX_PATH.with_suffix(".tmp")
+        temporary.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, TILE_URL_INDEX_PATH)
 
 
 def tile_paths_from_metadata(metadata_path: Path, cache_dir: Path = GLOBAL_TILES_DIR) -> list[Path]:
@@ -216,6 +269,15 @@ def fetch_tile_or_json(url: str) -> tuple[str, dict | bytes]:
             _FETCH_STATS["cache_hits"] += 1
         return cached
 
+    persistent_tile = cached_tile_for_url(url)
+    if persistent_tile is not None:
+        result = ("glb", persistent_tile)
+        with FETCH_CACHE_LOCK:
+            FETCH_CACHE[url] = result
+        with _STATS_LOCK:
+            _FETCH_STATS["cache_hits"] += 1
+        return result
+
     session = _get_session()
     last_error = None
     for attempt in range(4):
@@ -235,6 +297,8 @@ def fetch_tile_or_json(url: str) -> tuple[str, dict | bytes]:
                     _FETCH_STATS["json_fetches"] += 1
             else:
                 result = ("glb", content)
+                content_hash = store_tile(content)
+                remember_tile_url(url, content_hash)
                 with _STATS_LOCK:
                     _FETCH_STATS["glb_fetches"] += 1
             with FETCH_CACHE_LOCK:

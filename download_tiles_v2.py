@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import math
 import os
@@ -28,6 +29,7 @@ from tiles_common import (
     latlon_to_ecef,
     merge_gltf,
     reset_fetch_stats,
+    store_tile,
     traverse_for_leaf_glbs,
 )
 
@@ -175,14 +177,10 @@ def main(
     reset_fetch_stats()
     started_at = time.perf_counter()
     output_path = artifact_dir / "stitched.gltf"
-    parts_path = artifact_dir / "parts"
+    metadata_path = artifact_dir / "metadata.json"
     debug_log_path = artifact_dir / "debug.log"
-    parts_path.mkdir(parents=True, exist_ok=True)
     dbg = setup_debug_logger(debug_log_path)
 
-    for filename in os.listdir(parts_path):
-        if filename.startswith("tile_") and filename.endswith(".glb"):
-            (parts_path / filename).unlink()
     for path in (output_path, output_path.with_suffix(".bin")):
         if path.exists():
             path.unlink()
@@ -203,7 +201,7 @@ def main(
     )
 
     seen_hashes: set[bytes] = set()
-    downloaded_tiles = 0
+    tile_hashes: list[str] = []
     total_raw_matches = 0
     total_ray_errors = 0
     completed = 0
@@ -235,24 +233,27 @@ def main(
                 if digest in seen_hashes:
                     continue
                 seen_hashes.add(digest)
-                part_path = parts_path / f"tile_{downloaded_tiles + 1:03d}.glb"
-                part_path.write_bytes(glb_bytes)
-                downloaded_tiles += 1
+                tile_hashes.append(store_tile(glb_bytes))
                 new_tiles += 1
 
             log(
                 f"[{completed}/{len(viewpoints)}] VP {index} ({lat:.6f}, {lon:.6f}) "
-                f"{sample_count} samples in {elapsed:.2f}s -> +{new_tiles} tiles ({downloaded_tiles} total)."
+                f"{sample_count} samples in {elapsed:.2f}s -> +{new_tiles} tiles ({len(tile_hashes)} total)."
             )
 
     stats = get_fetch_stats()
-    if not downloaded_tiles:
+    if not tile_hashes:
         log(f"Error: No GLB tiles were fetched. Fetch stats: {stats}")
         return
 
-    log(f"\nMerging {downloaded_tiles} unique tiles...")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+    metadata.update({"tile_hashes": tile_hashes, "tile_count": len(tile_hashes)})
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    log(f"\nMerging {len(tile_hashes)} unique tiles...")
     merge_started_at = time.perf_counter()
-    merge_gltf(parts_path, output_path)
+    merge_gltf(artifact_dir, output_path)
     merge_elapsed = time.perf_counter() - merge_started_at
     total_elapsed = time.perf_counter() - started_at
     dbg.info("Fetch stats summary: %s", stats)

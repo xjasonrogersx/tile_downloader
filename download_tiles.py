@@ -24,8 +24,6 @@ from tiles_common import (
     ELEVATION_API_URL,
     HEIGHT,
     HEIGHT_PROBE_OFFSETS,
-    OUTPUT_PATH,
-    PARTS_PATH,
     OutputTee,
     build_tile_url,
     fetch_center_height,
@@ -33,6 +31,7 @@ from tiles_common import (
     is_point_in_box,
     latlon_to_ecef,
     merge_gltf,
+    store_tile,
     traverse_for_leaf_glb,
     traverse_for_leaf_glbs,
 )
@@ -106,13 +105,11 @@ def download_sample_tiles(index: int, lat: float, lon: float, center_height: flo
 # ==========================================
 def main(workers: int):
     download_started_at = time.perf_counter()
-    os.makedirs(PARTS_PATH, exist_ok=True)
-    for filename in os.listdir(PARTS_PATH):
-        if filename.startswith("tile_") and filename.endswith(".glb"):
-            os.remove(os.path.join(PARTS_PATH, filename))
-    for output_path in (OUTPUT_PATH, str(Path(OUTPUT_PATH).with_suffix(".bin"))):
-        if os.path.exists(output_path):
-            os.remove(output_path)
+    output_path = Path(ARTIFACTS_DIR) / "stitched.gltf"
+    metadata_path = Path(ARTIFACTS_DIR) / "metadata.json"
+    for path in (output_path, output_path.with_suffix(".bin")):
+        if path.exists():
+            path.unlink()
 
     root_url = build_tile_url("root.json", API_KEY)
     _, root_tileset = fetch_tile_or_json(root_url)
@@ -122,8 +119,8 @@ def main(workers: int):
     print(f"Using center elevation {center_height:.1f} m as the tile sampling height.")
     print(f"Sampling {len(grid_points)} grid points over a {RADIUS_METERS * 2}m x {RADIUS_METERS * 2}m area...")
 
-    unique_glbs = set()
-    downloaded_tiles = 0
+    unique_hashes = set()
+    tile_hashes = []
 
     print(f"Using {workers} concurrent download workers.")
     sample_args = [
@@ -140,32 +137,33 @@ def main(workers: int):
             new_tiles = 0
             # Hash GLB content to avoid adding duplicates
             for glb_bytes in sample_glbs:
-                glb_hash = hash(glb_bytes)
-                if glb_hash in unique_glbs:
+                glb_hash = store_tile(glb_bytes)
+                if glb_hash in unique_hashes:
                     continue
-                unique_glbs.add(glb_hash)
-                os.makedirs(PARTS_PATH, exist_ok=True)
-                part_path = os.path.join(PARTS_PATH, f"tile_{downloaded_tiles + 1:03d}.glb")
-                with open(part_path, "wb") as part_file:
-                    part_file.write(glb_bytes)
-                downloaded_tiles += 1
+                unique_hashes.add(glb_hash)
+                tile_hashes.append(glb_hash)
                 new_tiles += 1
-                print(f"  -> Downloaded new unique tile mesh ({len(glb_bytes) // 1024} KB) to {part_path}")
+                print(f"  -> Stored unique tile mesh ({len(glb_bytes) // 1024} KB) in shared cache")
             if not new_tiles:
                 print("  -> All matching tiles were already downloaded.")
         else:
             print("  -> No leaf tile found for this point.")
 
-    if not downloaded_tiles:
+    if not tile_hashes:
         print("Error: No GLB tiles were fetched.")
         return
 
-    print(f"\nMerging {downloaded_tiles} unique tiles while preserving glTF node transforms...")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+    metadata.update({"tile_hashes": tile_hashes, "tile_count": len(tile_hashes)})
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    print(f"\nMerging {len(tile_hashes)} unique tiles while preserving glTF node transforms...")
     merge_started_at = time.perf_counter()
-    merge_gltf(Path(PARTS_PATH), Path(OUTPUT_PATH))
+    merge_gltf(Path(ARTIFACTS_DIR), output_path)
     merge_seconds = time.perf_counter() - merge_started_at
     total_seconds = time.perf_counter() - download_started_at
-    print(f"Successfully saved combined street GLTF to: {OUTPUT_PATH}")
+    print(f"Successfully saved combined street GLTF to: {output_path}")
     print(f"Merge took {merge_seconds:.2f}s; total download and merge took {total_seconds:.2f}s.")
 
     # Display preview window
@@ -187,7 +185,6 @@ if __name__ == "__main__":
     GRID_STEPS = args.grid_steps
     ARTIFACTS_DIR = args.artifact_dir.resolve()
     OUTPUT_PATH = str(ARTIFACTS_DIR / "stitched.gltf")
-    PARTS_PATH = str(ARTIFACTS_DIR / "parts")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     with (BASE_DIR / "log.txt").open("a", encoding="utf-8") as log_file:

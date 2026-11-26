@@ -10,6 +10,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from tiles_common import GLOBAL_TILES_DIR, tile_paths_from_metadata
+
 
 def _aligned_length(length: int) -> int:
     """Return the next 4-byte-aligned length required by GLTF."""
@@ -82,12 +84,11 @@ def _remap_texture_indices(value: Any, texture_offset: int) -> Any:
     return result
 
 
-def merge_gltf(parts_dir: Path, output_path: Path) -> None:
-    files = sorted(
-        path for path in parts_dir.iterdir() if path.suffix.lower() in {".gltf", ".glb"}
-    )
+def merge_gltf(area_or_metadata: Path, output_path: Path) -> None:
+    metadata_path = area_or_metadata / "metadata.json" if area_or_metadata.is_dir() else area_or_metadata
+    files = tile_paths_from_metadata(metadata_path, GLOBAL_TILES_DIR)
     if not files:
-        raise ValueError(f"No .gltf or .glb files found in {parts_dir}")
+        raise ValueError(f"No tiles listed in {metadata_path}")
 
     merged: dict[str, Any] = {
         "asset": {"version": "2.0", "generator": "merge_gltf.py"},
@@ -215,13 +216,7 @@ def merge_gltf(parts_dir: Path, output_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "parts_dir",
-        nargs="?",
-        type=Path,
-        default=Path(__file__).with_name("parts"),
-        help="directory containing source .gltf files",
-    )
+    parser.add_argument("area_or_metadata", type=Path, help="area directory or metadata.json path")
     parser.add_argument(
         "-o",
         "--output",
@@ -230,7 +225,7 @@ def main() -> None:
         help="output GLTF path (the binary is written beside it)",
     )
     args = parser.parse_args()
-    merge_gltf(args.parts_dir, args.output)
+    merge_gltf(args.area_or_metadata, args.output)
     print(f"Merged GLTF written to {args.output}")
 
 
