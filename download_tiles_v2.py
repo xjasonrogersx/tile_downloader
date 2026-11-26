@@ -33,12 +33,7 @@ from download_tiles import (
 )
 
 CAMERA_EYE_OFFSET = 30.0
-PAN_HEADINGS = tuple(float(deg) for deg in range(0, 360, 45))
-CAMERA_TILTS = (30.0, 50.0, 70.0)
-CAMERA_RANGES = (25.0, 65.0, 120.0)
-CAMERA_TARGET_HEIGHT_OFFSETS = (-40.0, 0.0, 40.0, 80.0)
-GROUND_HEIGHT_OFFSETS = (-20.0, 0.0, 20.0, 40.0)
-RAY_FRACTIONS = (0.35, 0.7, 1.0)
+SURFACE_HEIGHT_OFFSETS = (-50.0, 0.0, 25.0, 50.0, 75.0, 100.0, 150.0)
 
 
 class OutputTee:
@@ -83,10 +78,9 @@ def offset_latlon(lat: float, lon: float, east_m: float, north_m: float) -> tupl
     return lat + lat_delta, lon + lon_delta
 
 
-def camera_ray_targets(
+def surface_targets(
     lat: float,
     lon: float,
-    camera_height: float,
     terrain_height: float,
     footprint_half_m: float,
 ) -> list[tuple[float, float, float]]:
@@ -102,53 +96,22 @@ def camera_ray_targets(
     for north_m in ground_offsets:
         for east_m in ground_offsets:
             target_lat, target_lon = offset_latlon(lat, lon, east_m, north_m)
-            for height_offset in GROUND_HEIGHT_OFFSETS:
+            for height_offset in SURFACE_HEIGHT_OFFSETS:
                 targets.append((target_lat, target_lon, terrain_height + height_offset))
-
-    for heading in PAN_HEADINGS:
-        heading_rad = math.radians(heading)
-        for tilt in CAMERA_TILTS:
-            tilt_rad = math.radians(tilt)
-            for distance in CAMERA_RANGES:
-                max_horiz = distance * math.cos(tilt_rad)
-                for height_offset in CAMERA_TARGET_HEIGHT_OFFSETS:
-                    end_height = terrain_height + height_offset
-                    for frac in RAY_FRACTIONS:
-                        horiz = max_horiz * frac
-                        east_m = horiz * math.sin(heading_rad)
-                        north_m = horiz * math.cos(heading_rad)
-                        interp_height = camera_height + (end_height - camera_height) * frac
-                        target_lat, target_lon = offset_latlon(lat, lon, east_m, north_m)
-                        targets.append((target_lat, target_lon, interp_height))
 
     return targets
 
 
 def camera_viewpoints(lat: float, lon: float, radius_m: float, steps: int, center_height: float):
-    lat_offset = radius_m / 111000.0
-    lon_offset = radius_m / (111000.0 * math.cos(math.radians(lat)))
-    latitudes = [lat - lat_offset + (2 * lat_offset * i / max(1, steps - 1)) for i in range(steps)]
-    longitudes = [lon - lon_offset + (2 * lon_offset * i / max(1, steps - 1)) for i in range(steps)]
     viewpoints = []
     camera_height = center_height + CAMERA_EYE_OFFSET
     idx = 1
 
-    for viewpoint_lat in latitudes:
-        for viewpoint_lon in longitudes:
+    for north_m in (-radius_m + (2 * radius_m * i / max(1, steps - 1)) for i in range(steps)):
+        for east_m in (-radius_m + (2 * radius_m * i / max(1, steps - 1)) for i in range(steps)):
+            viewpoint_lat, viewpoint_lon = offset_latlon(lat, lon, east_m, north_m)
             viewpoints.append((idx, viewpoint_lat, viewpoint_lon, camera_height))
             idx += 1
-
-    ring_radius = radius_m * 1.15
-    for deg in range(0, 360, 30):
-        rad = math.radians(deg)
-        ring_lat, ring_lon = offset_latlon(
-            lat,
-            lon,
-            east_m=ring_radius * math.sin(rad),
-            north_m=ring_radius * math.cos(rad),
-        )
-        viewpoints.append((idx, ring_lat, ring_lon, camera_height))
-        idx += 1
 
     return viewpoints
 
@@ -181,7 +144,7 @@ def download_camera_viewpoint(
     raw_match_count = 0
     error_count = 0
 
-    targets = camera_ray_targets(lat, lon, camera_height, terrain_height, footprint_half_m)
+    targets = surface_targets(lat, lon, terrain_height, footprint_half_m)
     dbg.debug(
         "VP %d start lat=%.6f lon=%.6f cam_h=%.1f terrain_h=%.1f %s",
         index,
@@ -192,16 +155,16 @@ def download_camera_viewpoint(
         summarize_targets(targets),
     )
 
-    for ray_idx, (target_lat, target_lon, target_height) in enumerate(targets):
+    for sample_idx, (target_lat, target_lon, target_height) in enumerate(targets):
         try:
             target_ecef = latlon_to_ecef(target_lat, target_lon, target_height)
             leaf_glbs = traverse_for_leaf_glbs(root_tileset["root"], target_ecef, API_KEY, root_url)
         except Exception as exc:
             error_count += 1
             dbg.error(
-                "VP %d ray=%d target=(%.6f, %.6f, %.1f) traversal error: %s\n%s",
+                "VP %d sample=%d target=(%.6f, %.6f, %.1f) traversal error: %s\n%s",
                 index,
-                ray_idx,
+                sample_idx,
                 target_lat,
                 target_lon,
                 target_height,
@@ -296,9 +259,8 @@ def main(
         f"({center_height:.1f} m terrain + {CAMERA_EYE_OFFSET:.1f} m eye offset)."
     )
     log(
-        f"Camera sweep: {len(viewpoints)} viewpoints, ground footprint half-width {footprint_half_m:.1f} m, "
-        f"plus {len(PAN_HEADINGS)} pan headings, {len(CAMERA_TILTS)} tilts, {len(CAMERA_RANGES)} ranges, "
-        f"{len(CAMERA_TARGET_HEIGHT_OFFSETS)} height bands, and {len(RAY_FRACTIONS)} ray steps."
+        f"Surface sweep: {len(viewpoints)} moving viewpoints, local footprint half-width "
+        f"{footprint_half_m:.1f} m, and {len(SURFACE_HEIGHT_OFFSETS)} height bands."
     )
     log(f"Using {workers} concurrent camera workers.")
 
@@ -403,7 +365,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Download Google 3D Tiles using a bounded panning-camera sweep."
+        description="Download Google 3D Tiles using moving viewpoints across a surface."
     )
     parser.add_argument("--latitude", type=float, default=CENTER_LAT)
     parser.add_argument("--longitude", type=float, default=CENTER_LON)

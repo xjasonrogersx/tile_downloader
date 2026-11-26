@@ -36,19 +36,20 @@ all matching street-level tile branches. This helps account for differences
 between DEM elevation and the vertical coordinates used by the 3D Tiles data,
 and helps retain both road-level and elevated building geometry.
 
-The web UI samples the region at approximately 15 metre intervals. Larger
-radii therefore require more tile requests and may take longer.
+The web UI includes a **Grid steps** slider for controlling grid sampling
+density. Higher values improve coverage but require more tile requests and may
+take longer. For camera sweep, it controls the number of moving viewpoints per
+axis across the selected square.
 
 ## Download methods
 
-The web UI provides two methods:
+The web UI provides two methods, with **Camera sweep** selected by default:
 
 - **Grid sampling:** the original method. It samples geographic points at
 	several heights and downloads matching street-level tiles.
-- **Camera sweep:** `download_tiles_v2.py` places bounded camera viewpoints
-	over the selected area. Each viewpoint pans through four headings and uses
-	three downward rays at different tilts and ranges. Matching tiles are
-	deduplicated before merging.
+- **Camera sweep:** `download_tiles_v2.py` moves bounded viewpoints across the
+	selected area. Each viewpoint samples a local surface patch at several
+	heights. Matching tiles are deduplicated before merging.
 
 Camera sweep is intended to improve coverage of surrounding sides and roofs,
 but it is still a downloader-side geometric approximation rather than a full

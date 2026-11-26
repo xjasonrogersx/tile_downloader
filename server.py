@@ -27,7 +27,7 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 job_lock = threading.Lock()
 log_lock = threading.Lock()
 download_process = None
-job = {"id": None, "area_id": None, "status": "idle", "message": "Choose a region on the map.", "progress": 0, "progress_total": 0, "lines": [], "artifacts": []}
+job = {"id": None, "area_id": None, "method": None, "status": "idle", "message": "Choose a region on the map.", "progress": 0, "progress_total": 0, "lines": [], "artifacts": []}
 
 
 def write_log(message: str) -> None:
@@ -89,7 +89,7 @@ def run_download(latitude: float, longitude: float, radius_meters: float, grid_s
         ]
     else:
         script_name = "download_tiles_v2.py" if method == "camera" else "download_tiles.py"
-        effective_steps = max(3, min(7, math.ceil(radius_meters / 50) + 1)) if method == "camera" else grid_steps
+        effective_steps = grid_steps
         command = [
             sys.executable,
             "-u",
@@ -188,7 +188,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_viewer(parse_qs(parsed.query).get("area", [""])[0])
             return
         if parsed.path == "/":
-            self.send_file(BASE_DIR / "web" / "index.html", "text/html; charset=utf-8")
+            html = (BASE_DIR / "web" / "index.html").read_text(encoding="utf-8").replace(
+                "Camera sweep uses bounded viewpoints and panning rays to collect surrounding geometry.",
+                "Camera sweep moves bounded viewpoints across the region to collect surrounding geometry.",
+            )
+            self.send_html(html.replace("</body>", MAIN_PAGE_SCRIPT + "</body>"))
             return
         if parsed.path.startswith("/files/"):
             parts = Path(parsed.path.removeprefix("/files/")).parts
@@ -225,12 +229,13 @@ class Handler(BaseHTTPRequestHandler):
             latitude = float(data["latitude"])
             longitude = float(data["longitude"])
             radius = max(5.0, min(1000.0, float(data["radiusMeters"])))
-            method = data.get("method", "grid")
+            method = data.get("method", "camera")
             if not isinstance(method, str) or method not in {"grid", "camera"}:
                 self.send_json({"error": "Unknown download method."}, 400)
                 return
             estimate = estimate_region(radius)
-            sampling_steps = max(3, min(7, math.ceil(radius / 50) + 1)) if method == "camera" else estimate["grid_steps"]
+            requested_grid_steps = int(data.get("gridSteps", estimate["grid_steps"]))
+            sampling_steps = max(3, min(101, requested_grid_steps))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             self.send_json({"error": "Invalid region parameters."}, 400)
             return
@@ -243,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
             area_dir = ARTIFACTS_DIR / area_id
             area_dir.joinpath("parts").mkdir(parents=True, exist_ok=True)
             write_metadata(area_dir, {"area_id": area_id, "name": area_id, "notes": "", "created_at": datetime.now(timezone.utc).isoformat(), "latitude": latitude, "longitude": longitude, "radius_meters": radius, "grid_steps": sampling_steps, "method": method})
-            job.update({"id": job_id, "area_id": area_id, "status": "running", "message": "Starting download...", "progress": 0, "progress_total": estimate["samples"], "lines": [], "artifacts": []})
+            job.update({"id": job_id, "area_id": area_id, "method": method, "status": "running", "message": "Starting download...", "progress": 0, "progress_total": estimate["samples"], "lines": [], "artifacts": []})
         thread = threading.Thread(target=run_download, args=(latitude, longitude, radius, sampling_steps, method, job_id, area_id), daemon=True)
         thread.start()
         self.send_json({"id": job_id, "area_id": area_id, **estimate})
@@ -282,7 +287,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "A download or gap scan is already running."}, 409)
                 return
             job_id = uuid.uuid4().hex
-            job.update({"id": job_id, "area_id": safe_area, "status": "running", "message": "Starting gap scan...", "progress": 0, "progress_total": scan_total, "lines": [], "artifacts": []})
+            job.update({"id": job_id, "area_id": safe_area, "method": "gap", "status": "running", "message": "Starting gap scan...", "progress": 0, "progress_total": scan_total, "lines": [], "artifacts": []})
         thread = threading.Thread(target=run_download, args=(0.0, 0.0, radius, 0, "gap", job_id, safe_area, spacing), daemon=True)
         thread.start()
         self.send_json({"id": job_id, "area_id": safe_area, "samples": scan_total})
@@ -397,6 +402,8 @@ VIEWER_HTML = """<!doctype html><html><head><meta charset='utf-8'><title>Tile vi
 <script type='module' src='https://ajax.googleapis.com/ajax/libs/model-viewer/4.0.0/model-viewer.min.js'></script>
 <style>html,body{height:100%;margin:0;background:#111;color:#eee;font:14px system-ui}header{height:52px;padding:0 20px;display:flex;align-items:center;border-bottom:1px solid #333}model-viewer{width:100%;height:calc(100% - 53px);background:#16191c}a{color:#8ed0c0;margin-left:auto}</style></head>
 <body><header><strong>__MODEL_NAME__</strong><a href='/'>Back to map</a></header><model-viewer src='__MODEL_URL__' camera-controls auto-rotate shadow-intensity='0.8' exposure='1.1'></model-viewer></body></html>"""
+
+MAIN_PAGE_SCRIPT = """<script>(function(){const method=document.getElementById('method'),radiusInput=document.getElementById('radius'),methodControl=method.closest('.control'),control=document.createElement('div');control.className='control';control.innerHTML='<label for="gridSteps">Grid steps <output><span id="gridStepsLabel">15</span> x <span id="gridStepsLabel2">15</span></output></label><input id="gridSteps" type="range" min="3" max="101" step="2" value="15"><div class="hint">More steps improve coverage but increase tile requests.</div>';methodControl.after(control);const gridStepsInput=document.getElementById('gridSteps'),gridStepsLabel=document.getElementById('gridStepsLabel'),gridStepsLabel2=document.getElementById('gridStepsLabel2');let manuallyChanged=false;function updateGridSteps(){gridStepsLabel.textContent=gridStepsInput.value;gridStepsLabel2.textContent=gridStepsInput.value}function updateDefault(){if(manuallyChanged)return;gridStepsInput.value=Math.max(3,Math.min(101,Math.ceil(Number(radiusInput.value)*2/15)+1));updateGridSteps()}gridStepsInput.oninput=function(){manuallyChanged=true;updateGridSteps()};radiusInput.addEventListener('input',updateDefault);updateDefault();const originalFetch=window.fetch.bind(window);window.fetch=function(resource,options){const url=typeof resource==='string'?resource:resource.url;if(url&&url.endsWith('/api/start')&&options&&options.body){const payload=JSON.parse(options.body);payload.gridSteps=Number(gridStepsInput.value);options=Object.assign({},options,{body:JSON.stringify(payload)})}return originalFetch(resource,options)}})();</script>"""
 
 AREA_HTML = """<!doctype html><html><head><meta charset='utf-8'><title>Area details</title>
 <script type='module' src='https://ajax.googleapis.com/ajax/libs/model-viewer/4.0.0/model-viewer.min.js'></script>
