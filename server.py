@@ -18,7 +18,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, quote, urlparse
 
-from tiles_common import GLOBAL_TILES_DIR, tile_cache_path
+from tiles_common import GLOBAL_TILES_DIR, latlon_to_ecef, tile_cache_path
 
 BASE_DIR = Path(__file__).resolve().parent
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
@@ -77,14 +77,77 @@ def cached_tile_info(content_hash: str) -> dict:
     return info
 
 
-def grid_data() -> dict:
+def glb_enu_bounds(content_hash: str, origin_lat: float, origin_lon: float) -> tuple[float, float, float, float] | None:
+    path = tile_cache_path(content_hash)
+    try:
+        data = path.read_bytes()
+        offset = 12
+        document = None
+        while offset + 8 <= len(data):
+            chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+            if chunk_type == 0x4E4F534A:
+                document = json.loads(data[offset + 8:offset + 8 + chunk_length].rstrip(b" \t\r\n\0"))
+                break
+            offset += 8 + chunk_length
+        if not document:
+            return None
+
+        lat = math.radians(origin_lat)
+        lon = math.radians(origin_lon)
+        origin = latlon_to_ecef(origin_lat, origin_lon, 0.0)
+        east_axis = (-math.sin(lon), math.cos(lon), 0.0)
+        north_axis = (-math.sin(lat) * math.cos(lon), -math.sin(lat) * math.sin(lon), math.cos(lat))
+        accessors = document.get("accessors", [])
+        meshes = document.get("meshes", [])
+        points = []
+        identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+        for node in document.get("nodes", []):
+            mesh_index = node.get("mesh")
+            if not isinstance(mesh_index, int) or mesh_index >= len(meshes):
+                continue
+            matrix = node.get("matrix", identity)
+            for primitive in meshes[mesh_index].get("primitives", []):
+                position_index = primitive.get("attributes", {}).get("POSITION")
+                if not isinstance(position_index, int) or position_index >= len(accessors):
+                    continue
+                accessor = accessors[position_index]
+                minimum, maximum = accessor.get("min"), accessor.get("max")
+                if not minimum or not maximum or len(minimum) < 3 or len(maximum) < 3:
+                    continue
+                for x in (minimum[0], maximum[0]):
+                    for y in (minimum[1], maximum[1]):
+                        for z in (minimum[2], maximum[2]):
+                            world = (
+                                matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12],
+                                matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13],
+                                matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14],
+                            )
+                            # Google GLB tile frames use X, Z, -Y relative to ECEF.
+                            ecef = (world[0], -world[2], world[1])
+                            relative = tuple(ecef[index] - origin[index] for index in range(3))
+                            points.append((
+                                sum(relative[index] * east_axis[index] for index in range(3)),
+                                sum(relative[index] * north_axis[index] for index in range(3)),
+                            ))
+        if not points:
+            return None
+        east = [point[0] for point in points]
+        north = [point[1] for point in points]
+        return min(east), min(north), max(east), max(north)
+    except (OSError, ValueError, IndexError, TypeError, json.JSONDecodeError, struct.error):
+        return None
+
+
+def grid_data(mode: str = "area") -> dict:
+    if mode not in {"area", "tiles"}:
+        raise ValueError(f"Unsupported grid mode: {mode}")
     area_dirs = sorted(
         path for path in ARTIFACTS_DIR.iterdir()
         if path.is_dir() and path != GLOBAL_TILES_DIR and (path / "metadata.json").exists()
     )
     records = [(area_dir, area_metadata(area_dir)) for area_dir in area_dirs]
     if not records:
-        return {"cell_size": 25, "rows": 0, "columns": 0, "cells": [], "areas": []}
+        return {"mode": mode, "description": "No downloaded areas.", "cell_size": 25, "rows": 0, "columns": 0, "cells": [], "areas": [], "unplaced_tiles": 0}
 
     min_lat = min(float(metadata.get("latitude", 0)) - float(metadata.get("radius_meters", 0)) / 111320 for _, metadata in records)
     max_lat = max(float(metadata.get("latitude", 0)) + float(metadata.get("radius_meters", 0)) / 111320 for _, metadata in records)
@@ -101,24 +164,37 @@ def grid_data() -> dict:
     min_lat = center_lat - (height * cell_size / 2) / 111320
     min_lon = (min_lon + max_lon) / 2 - (width * cell_size / 2) / meters_per_degree_lon
     tile_info = {}
+    tile_bounds = {}
+    all_hashes = set()
     for _, metadata in records:
-        for content_hash in metadata.get("tile_hashes", []):
-            content_hash = str(content_hash)
-            if content_hash not in tile_info:
-                tile_info[content_hash] = cached_tile_info(content_hash)
+        all_hashes.update(str(content_hash) for content_hash in metadata.get("tile_hashes", []))
+    if mode == "tiles":
+        for content_hash in all_hashes:
+            tile_info[content_hash] = cached_tile_info(content_hash)
+            tile_bounds[content_hash] = glb_enu_bounds(content_hash, center_lat, center_lon)
+
     cells = []
+    unplaced_tiles = 0
     for row in range(height):
         for column in range(width):
             cell_lat = min_lat + (row + 0.5) * cell_size / 111320
             cell_lon = min_lon + (column + 0.5) * cell_size / meters_per_degree_lon
             covered = []
             hashes = set()
-            for area_dir, metadata in records:
-                area_lat, area_lon = float(metadata.get("latitude", 0)), float(metadata.get("longitude", 0))
-                distance = math.hypot((cell_lat - area_lat) * 111320, (cell_lon - area_lon) * meters_per_degree_lon)
-                if distance <= float(metadata.get("radius_meters", 0)):
-                    covered.append(area_dir.name)
-                    hashes.update(str(content_hash) for content_hash in metadata.get("tile_hashes", []))
+            if mode == "tiles":
+                cell_east = (cell_lon - center_lon) * meters_per_degree_lon
+                cell_north = (cell_lat - center_lat) * 111320
+                for content_hash, bounds in tile_bounds.items():
+                    if bounds and bounds[0] <= cell_east + cell_size / 2 and bounds[2] >= cell_east - cell_size / 2 and bounds[1] <= cell_north + cell_size / 2 and bounds[3] >= cell_north - cell_size / 2:
+                        hashes.add(content_hash)
+                covered = [area_dir.name for area_dir, metadata in records if any(content_hash in set(str(item) for item in metadata.get("tile_hashes", [])) for content_hash in hashes)]
+            else:
+                for area_dir, metadata in records:
+                    area_lat, area_lon = float(metadata.get("latitude", 0)), float(metadata.get("longitude", 0))
+                    distance = math.hypot((cell_lat - area_lat) * 111320, (cell_lon - area_lon) * meters_per_degree_lon)
+                    if distance <= float(metadata.get("radius_meters", 0)):
+                        covered.append(area_dir.name)
+                        hashes.update(str(content_hash) for content_hash in metadata.get("tile_hashes", []))
             cells.append({
                 "row": row,
                 "column": column,
@@ -126,9 +202,12 @@ def grid_data() -> dict:
                 "tiles": len(hashes),
                 "centroid": {"latitude": cell_lat, "longitude": cell_lon},
                 "size_m": cell_size,
-                "tile_details": [tile_info[content_hash] for content_hash in sorted(hashes)],
+                "tile_details": [cached_tile_info(content_hash) for content_hash in sorted(hashes)],
             })
-    return {"cell_size": cell_size, "rows": height, "columns": width, "min_lat": min_lat, "min_lon": min_lon, "max_lat": max_lat, "max_lon": max_lon, "cells": cells, "areas": [{"id": area_dir.name, "name": metadata.get("name", area_dir.name), "latitude": metadata.get("latitude"), "longitude": metadata.get("longitude"), "radius_meters": metadata.get("radius_meters"), "tile_count": len(metadata.get("tile_hashes", []))} for area_dir, metadata in records]}
+    if mode == "tiles":
+        unplaced_tiles = sum(1 for bounds in tile_bounds.values() if bounds is None)
+    description = "Approximate transformed GLB footprints; tiles may appear in multiple cells." if mode == "tiles" else "Area radius coverage; counts use each covered area's manifest."
+    return {"mode": mode, "description": description, "cell_size": cell_size, "rows": height, "columns": width, "min_lat": min_lat, "min_lon": min_lon, "max_lat": max_lat, "max_lon": max_lon, "cells": cells, "areas": [{"id": area_dir.name, "name": metadata.get("name", area_dir.name), "latitude": metadata.get("latitude"), "longitude": metadata.get("longitude"), "radius_meters": metadata.get("radius_meters"), "tile_count": len(metadata.get("tile_hashes", []))} for area_dir, metadata in records], "unplaced_tiles": unplaced_tiles}
 
 
 def artifact_list(area_id: str | None = None) -> list[dict[str, str | int]]:
@@ -242,7 +321,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/grid":
             try:
-                self.send_json(grid_data())
+                mode = parse_qs(parsed.query).get("mode", ["area"])[0]
+                self.send_json(grid_data(mode))
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 self.send_json({"error": f"Could not build coverage grid: {exc}"}, 500)
             return
@@ -484,9 +564,10 @@ AREA_HTML = """<!doctype html><html><head><meta charset='utf-8'><meta name='view
 
 AREA_HTML = AREA_HTML.replace("delete.onclick", "document.getElementById('delete').onclick").replace("delete.disabled", "document.getElementById('delete').disabled")
 AREA_HTML = AREA_HTML.replace("/merged.gltf", "/stitched.gltf").replace("<h2>Merged model</h2>", "<h2>Stitched model</h2>")
+AREA_HTML = AREA_HTML.replace("<dt>Radius</dt><dd id='radius'></dd>", "<dt>Radius</dt><dd id='radius'></dd><dt>Center ground level</dt><dd id='centerElevation'></dd>")
 AREA_HTML = AREA_HTML.replace(
     "</body></html>",
-    """<script>(function(){const areaData=__AREA_JSON__;const nameField=document.getElementById('name'),notesField=document.getElementById('notes'),areaIdField=document.getElementById('areaId'),coordinatesField=document.getElementById('coordinates'),radiusField=document.getElementById('radius'),detailsForm=document.getElementById('details'),saveStatus=document.getElementById('saveStatus'),deleteButton=document.getElementById('delete'),deleteStatus=document.getElementById('deleteStatus');nameField.value=areaData.name||areaData.area_id;notesField.value=areaData.notes||'';areaIdField.textContent=areaData.area_id;coordinatesField.textContent=`${Number(areaData.latitude).toFixed(5)}, ${Number(areaData.longitude).toFixed(5)}`;radiusField.textContent=`${areaData.radius_meters||'-'} m`;detailsForm.onsubmit=async event=>{event.preventDefault();const response=await fetch('/api/area-details',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({area_id:areaData.area_id,name:nameField.value,notes:notesField.value})});saveStatus.textContent=response.ok?'Saved':'Save failed'};deleteButton.onclick=async()=>{if(!confirm('Delete this area and all downloaded artifacts? This cannot be undone.'))return;deleteButton.disabled=true;const response=await fetch('/api/delete-area',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({area_id:areaData.area_id})});if(response.ok)location.href='/';else{deleteButton.disabled=false;deleteStatus.textContent=(await response.json()).error||'Delete failed'}}})();</script></body></html>""",
+    """<script>(function(){const areaData=__AREA_JSON__;const nameField=document.getElementById('name'),notesField=document.getElementById('notes'),areaIdField=document.getElementById('areaId'),coordinatesField=document.getElementById('coordinates'),radiusField=document.getElementById('radius'),centerElevationField=document.getElementById('centerElevation'),detailsForm=document.getElementById('details'),saveStatus=document.getElementById('saveStatus'),deleteButton=document.getElementById('delete'),deleteStatus=document.getElementById('deleteStatus');nameField.value=areaData.name||areaData.area_id;notesField.value=areaData.notes||'';areaIdField.textContent=areaData.area_id;coordinatesField.textContent=`${Number(areaData.latitude).toFixed(5)}, ${Number(areaData.longitude).toFixed(5)}`;radiusField.textContent=`${areaData.radius_meters||'-'} m`;centerElevationField.textContent=Number.isFinite(Number(areaData.center_elevation_m))?`${Number(areaData.center_elevation_m).toFixed(1)} m`:'Not recorded';detailsForm.onsubmit=async event=>{event.preventDefault();const response=await fetch('/api/area-details',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({area_id:areaData.area_id,name:nameField.value,notes:notesField.value})});saveStatus.textContent=response.ok?'Saved':'Save failed'};deleteButton.onclick=async()=>{if(!confirm('Delete this area and all downloaded artifacts? This cannot be undone.'))return;deleteButton.disabled=true;const response=await fetch('/api/delete-area',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({area_id:areaData.area_id})});if(response.ok)location.href='/';else{deleteButton.disabled=false;deleteStatus.textContent=(await response.json()).error||'Delete failed'}}})();</script></body></html>""",
 )
 
 if __name__ == "__main__":

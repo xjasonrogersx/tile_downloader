@@ -154,7 +154,7 @@ def main(workers: int):
         return
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
-    metadata.update({"tile_hashes": tile_hashes, "tile_count": len(tile_hashes)})
+    metadata.update({"center_elevation_m": center_height, "tile_hashes": tile_hashes, "tile_count": len(tile_hashes)})
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 

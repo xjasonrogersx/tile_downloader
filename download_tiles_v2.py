@@ -35,7 +35,7 @@ from tiles_common import (
 
 CAMERA_EYE_OFFSET = 30.0
 # Concentrated around observed +35m..+55m hit band with a small buffer on both sides
-SURFACE_HEIGHT_OFFSETS = (30.0, 38.0, 44.0, 48.0, 52.0, 56.0, 62.0, 70.0 ,  80.0, 100.0, 130.0, 160.0)
+SURFACE_HEIGHT_OFFSETS = (-20.0, -10.0, 0.0, 10.0, 20.0, 25.0, 30.0, 38.0, 44.0, 48.0, 52.0, 56.0, 62.0, 70.0, 80.0, 100.0, 130.0, 160.0)
 
 
 def setup_debug_logger(debug_log_path: Path) -> logging.Logger:
@@ -247,7 +247,7 @@ def main(
         return
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
-    metadata.update({"tile_hashes": tile_hashes, "tile_count": len(tile_hashes)})
+    metadata.update({"center_elevation_m": center_height, "tile_hashes": tile_hashes, "tile_count": len(tile_hashes)})
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
