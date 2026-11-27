@@ -35,7 +35,7 @@ from tiles_common import (
 
 CAMERA_EYE_OFFSET = 30.0
 # Concentrated around observed +35m..+55m hit band with a small buffer on both sides
-SURFACE_HEIGHT_OFFSETS = (30.0, 38.0, 44.0, 48.0, 52.0, 56.0, 62.0, 70.0)
+SURFACE_HEIGHT_OFFSETS = (30.0, 38.0, 44.0, 48.0, 52.0, 56.0, 62.0, 70.0 ,  80.0, 100.0, 130.0, 160.0)
 
 
 def setup_debug_logger(debug_log_path: Path) -> logging.Logger:

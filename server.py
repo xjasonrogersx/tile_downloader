@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -24,6 +25,7 @@ ARTIFACTS_DIR = BASE_DIR / "artifacts"
 HOST = "127.0.0.1"
 PORT = 8000
 LOG_PATH = BASE_DIR / "log.txt"
+CELL_MERGES_DIR = ARTIFACTS_DIR / "cell_merges"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 job_lock = threading.Lock()
@@ -49,6 +51,84 @@ def area_metadata(area_dir: Path) -> dict:
     if metadata_path.exists():
         return json.loads(metadata_path.read_text(encoding="utf-8"))
     return {"area_id": area_dir.name}
+
+
+def cached_tile_info(content_hash: str) -> dict:
+    path = tile_cache_path(content_hash)
+    info = {"hash": content_hash, "file": path.name, "bytes": path.stat().st_size, "nodes": 0, "meshes": 0, "min_z": None, "max_z": None, "height": None}
+    try:
+        data = path.read_bytes()
+        offset = 12
+        document = None
+        while offset + 8 <= len(data):
+            chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+            if chunk_type == 0x4E4F534A:
+                document = json.loads(data[offset + 8:offset + 8 + chunk_length].rstrip(b" \t\r\n\0"))
+                break
+            offset += 8 + chunk_length
+        if not document:
+            return info
+        z_values = [value for accessor in document.get("accessors", []) if accessor.get("type") == "VEC3" and accessor.get("min") and accessor.get("max") for value in (accessor["min"][2], accessor["max"][2])]
+        info.update({"nodes": len(document.get("nodes", [])), "meshes": len(document.get("meshes", []))})
+        if z_values:
+            info.update({"min_z": min(z_values), "max_z": max(z_values), "height": max(z_values) - min(z_values)})
+    except (OSError, ValueError, IndexError, TypeError, json.JSONDecodeError, struct.error):
+        pass
+    return info
+
+
+def grid_data() -> dict:
+    area_dirs = sorted(
+        path for path in ARTIFACTS_DIR.iterdir()
+        if path.is_dir() and path != GLOBAL_TILES_DIR and (path / "metadata.json").exists()
+    )
+    records = [(area_dir, area_metadata(area_dir)) for area_dir in area_dirs]
+    if not records:
+        return {"cell_size": 25, "rows": 0, "columns": 0, "cells": [], "areas": []}
+
+    min_lat = min(float(metadata.get("latitude", 0)) - float(metadata.get("radius_meters", 0)) / 111320 for _, metadata in records)
+    max_lat = max(float(metadata.get("latitude", 0)) + float(metadata.get("radius_meters", 0)) / 111320 for _, metadata in records)
+    center_lat = (min_lat + max_lat) / 2
+    meters_per_degree_lon = 111320 * max(0.01, math.cos(math.radians(center_lat)))
+    min_lon = min(float(metadata.get("longitude", 0)) - float(metadata.get("radius_meters", 0)) / meters_per_degree_lon for _, metadata in records)
+    max_lon = max(float(metadata.get("longitude", 0)) + float(metadata.get("radius_meters", 0)) / meters_per_degree_lon for _, metadata in records)
+    center_lon = (min_lon + max_lon) / 2
+    cell_size = 25
+    width = max(1, math.ceil((max_lon - min_lon) * meters_per_degree_lon / cell_size))
+    height = max(1, math.ceil((max_lat - min_lat) * 111320 / cell_size))
+    width = min(width, 80)
+    height = min(height, 80)
+    min_lat = center_lat - (height * cell_size / 2) / 111320
+    min_lon = (min_lon + max_lon) / 2 - (width * cell_size / 2) / meters_per_degree_lon
+    tile_info = {}
+    for _, metadata in records:
+        for content_hash in metadata.get("tile_hashes", []):
+            content_hash = str(content_hash)
+            if content_hash not in tile_info:
+                tile_info[content_hash] = cached_tile_info(content_hash)
+    cells = []
+    for row in range(height):
+        for column in range(width):
+            cell_lat = min_lat + (row + 0.5) * cell_size / 111320
+            cell_lon = min_lon + (column + 0.5) * cell_size / meters_per_degree_lon
+            covered = []
+            hashes = set()
+            for area_dir, metadata in records:
+                area_lat, area_lon = float(metadata.get("latitude", 0)), float(metadata.get("longitude", 0))
+                distance = math.hypot((cell_lat - area_lat) * 111320, (cell_lon - area_lon) * meters_per_degree_lon)
+                if distance <= float(metadata.get("radius_meters", 0)):
+                    covered.append(area_dir.name)
+                    hashes.update(str(content_hash) for content_hash in metadata.get("tile_hashes", []))
+            cells.append({
+                "row": row,
+                "column": column,
+                "areas": len(covered),
+                "tiles": len(hashes),
+                "centroid": {"latitude": cell_lat, "longitude": cell_lon},
+                "size_m": cell_size,
+                "tile_details": [tile_info[content_hash] for content_hash in sorted(hashes)],
+            })
+    return {"cell_size": cell_size, "rows": height, "columns": width, "min_lat": min_lat, "min_lon": min_lon, "max_lat": max_lat, "max_lon": max_lon, "cells": cells, "areas": [{"id": area_dir.name, "name": metadata.get("name", area_dir.name), "latitude": metadata.get("latitude"), "longitude": metadata.get("longitude"), "radius_meters": metadata.get("radius_meters"), "tile_count": len(metadata.get("tile_hashes", []))} for area_dir, metadata in records]}
 
 
 def artifact_list(area_id: str | None = None) -> list[dict[str, str | int]]:
@@ -160,6 +240,12 @@ class Handler(BaseHTTPRequestHandler):
                 areas.append({**metadata, "details": f"/area?area={quote(area_dir.name)}"})
             self.send_json(areas)
             return
+        if parsed.path == "/api/grid":
+            try:
+                self.send_json(grid_data())
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                self.send_json({"error": f"Could not build coverage grid: {exc}"}, 500)
+            return
         if parsed.path == "/api/artifacts":
             self.send_json(artifact_list())
             return
@@ -171,6 +257,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/area":
             self.send_area(parse_qs(parsed.query).get("area", [""])[0])
             return
+        if parsed.path == "/grid":
+            self.send_grid()
+            return
         if parsed.path == "/viewer":
             self.send_viewer(parse_qs(parsed.query).get("area", [""])[0])
             return
@@ -179,6 +268,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Camera sweep uses bounded viewpoints and panning rays to collect surrounding geometry.",
                 "Camera sweep moves bounded viewpoints across the region to collect surrounding geometry.",
             )
+            html = html.replace("</aside>", '<a href="/grid" style="color:#23685b;font-weight:600;text-decoration:none">Open coverage grid</a></aside>')
             self.send_html(html.replace("</body>", MAIN_PAGE_SCRIPT + "</body>"))
             return
         if parsed.path.startswith("/files/"):
@@ -191,6 +281,21 @@ class Handler(BaseHTTPRequestHandler):
                 content_type = "model/gltf-binary" if candidate.suffix == ".glb" else "model/gltf+json" if candidate.suffix == ".gltf" else "application/octet-stream"
                 self.send_file(candidate, content_type, download=True)
                 return
+        if parsed.path.startswith("/cache/"):
+            cache_name = Path(parsed.path.removeprefix("/cache/")).name
+            if re.fullmatch(r"[0-9a-f]{64}\.glb", cache_name):
+                candidate = GLOBAL_TILES_DIR / cache_name
+                if candidate.is_file():
+                    self.send_file(candidate, "model/gltf-binary")
+                    return
+        if parsed.path.startswith("/cell-files/"):
+            parts = Path(parsed.path.removeprefix("/cell-files/")).parts
+            if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{32}", parts[0]) and parts[1] in {"cell_merge.gltf", "cell_merge.bin"}:
+                candidate = CELL_MERGES_DIR / parts[0] / parts[1]
+                if candidate.is_file():
+                    content_type = "model/gltf+json" if candidate.suffix == ".gltf" else "application/octet-stream"
+                    self.send_file(candidate, content_type)
+                    return
         self.send_error(404)
 
     def do_POST(self) -> None:
@@ -203,6 +308,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/delete-area":
             self.delete_area()
+            return
+        if path == "/api/merge-cell":
+            self.merge_cell()
             return
         if path != "/api/start":
             self.send_error(404)
@@ -278,6 +386,48 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             self.send_json({"error": "Invalid area id."}, 400)
 
+    def merge_cell(self) -> None:
+        merge_dir = None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(length))
+            hashes = data["tile_hashes"]
+            if not isinstance(hashes, list) or not hashes or len(hashes) > 500:
+                raise ValueError("A cell must contain between 1 and 500 tiles.")
+            normalized = []
+            for content_hash in hashes:
+                if not isinstance(content_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
+                    raise ValueError("Invalid cached tile hash.")
+                if not tile_cache_path(content_hash).is_file():
+                    raise ValueError("A requested cached tile is missing.")
+                if content_hash not in normalized:
+                    normalized.append(content_hash)
+            merge_id = uuid.uuid4().hex
+            merge_dir = CELL_MERGES_DIR / merge_id
+            merge_dir.mkdir(parents=True, exist_ok=False)
+            metadata_path = merge_dir / "metadata.json"
+            metadata_path.write_text(json.dumps({"tile_hashes": normalized}) + "\n", encoding="utf-8")
+            output_path = merge_dir / "cell_merge.gltf"
+            result = subprocess.run(
+                [sys.executable, str(BASE_DIR / "merge_gltf.py"), str(metadata_path), "--output", str(output_path)],
+                cwd=BASE_DIR,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "Cell merge failed.")
+            self.send_json({"merge_id": merge_id, "tile_count": len(normalized), "model_url": f"/cell-files/{merge_id}/cell_merge.gltf"})
+        except subprocess.TimeoutExpired:
+            if merge_dir:
+                shutil.rmtree(merge_dir, ignore_errors=True)
+            self.send_json({"error": "Cell merge timed out."}, 504)
+        except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError, OSError) as exc:
+            if merge_dir:
+                shutil.rmtree(merge_dir, ignore_errors=True)
+            self.send_json({"error": str(exc) or "Invalid cell merge request."}, 400)
+
     def send_file(self, path: Path, content_type: str, download: bool = False) -> None:
         data = path.read_bytes()
         self.send_response(200)
@@ -302,6 +452,10 @@ class Handler(BaseHTTPRequestHandler):
         metadata = area_metadata(ARTIFACTS_DIR / safe_area)
         model_url = "/files/" + quote(safe_area) + "/stitched.gltf"
         html = VIEWER_HTML.replace("__MODEL_URL__", model_url).replace("__MODEL_NAME__", str(metadata.get("name", safe_area)))
+        self.send_html(html)
+
+    def send_grid(self) -> None:
+        html = (BASE_DIR / "web" / "grid.html").read_text(encoding="utf-8")
         self.send_html(html)
 
     def send_html(self, html: str) -> None:

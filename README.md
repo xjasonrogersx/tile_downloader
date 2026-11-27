@@ -1,7 +1,7 @@
 # Google 3D Tile Downloader
 
-Downloads Google Photorealistic 3D Tiles for a selected map region, saves the
-individual GLB tiles, and merges them into a single glTF model.
+Downloads Google Photorealistic 3D Tiles for selected map regions, stores the
+individual GLB tiles in a shared cache, and merges them into glTF models.
 
 ## Requirements
 
@@ -30,6 +30,14 @@ python3 server.py
 Open `http://127.0.0.1:8000` and click the map to set the center of the
 download region. Choose a radius and start the download.
 
+The main page links to the **Coverage grid** at
+`http://127.0.0.1:8000/grid`. If port 8000 is already in use, the server can be
+started on another port from Python, for example:
+
+```bash
+python3 -c 'import server; server.ThreadingHTTPServer(("127.0.0.1", 8001), server.Handler).serve_forever()'
+```
+
 The downloader estimates the center terrain elevation through the Open-Meteo
 Elevation API. It then probes several heights around that value and collects
 all matching street-level tile branches. This helps account for differences
@@ -40,6 +48,19 @@ The web UI includes a **Grid steps** slider for controlling grid sampling
 density. Higher values improve coverage but require more tile requests and may
 take longer. For camera sweep, it controls the number of moving viewpoints per
 axis across the selected square.
+
+## Coverage grid
+
+The coverage grid provides a top-down view of all downloaded areas. It uses
+25-metre square cells, colors cells covered by one or more areas, and displays
+the number of distinct cached tile hashes associated with each covered cell.
+Click a cell to inspect its centroid, dimensions, cached tiles, GLB size,
+node/mesh counts, and local geometry height bounds.
+
+Each tile in the selected-cell panel has a **View tile** action that opens the
+cached GLB in a model viewer. **Merge cell tiles and view** creates a temporary
+manifest for the selected hashes, runs `merge_gltf.py` in a subprocess, and
+opens the resulting `cell_merge.gltf` in the same viewer.
 
 ## Download methods
 
@@ -78,6 +99,11 @@ Each download creates an area directory containing:
 - `metadata.json`: center, radius, method, and ordered `tile_hashes`
 - `stitched.gltf` and `stitched.bin`: stitched model shown by the web viewer
 
+Cell merges are written under `artifacts/cell_merges/<merge-id>/` and contain:
+
+- `metadata.json`: the selected cell's tile hash manifest
+- `cell_merge.gltf` and `cell_merge.bin`: the merged cell model
+
 The source GLBs are stored once in the shared `artifacts/tiles/` directory,
 named by their SHA-256 hash. When another area finds the same tile, it reuses
 the cached file instead of downloading it again. The area manifest in
@@ -86,6 +112,14 @@ the cached file instead of downloading it again. The area manifest in
 Downloader stdout and stderr are appended to `log.txt` while also being shown
 in the terminal. The log is useful for checking sample progress, missing tile
 points, API failures, and merge errors.
+
+The local server exposes these useful routes:
+
+- `/`: map downloader and area history
+- `/grid`: cached-area coverage grid
+- `/area?area=<area-id>`: area metadata and stitched model viewer
+- `/api/grid`: grid data, cell metadata, and cached tile details
+- `/api/merge-cell`: merge a validated list of cached tile hashes
 
 If a road or roof is missing, repeat the download with a larger radius and
 ensure the selected region covers the complete feature. A denser grid can be
