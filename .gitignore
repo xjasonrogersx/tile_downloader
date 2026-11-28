@@ -7,3 +7,4 @@ __pycache__/server.cpython-312.pyc
 __pycache__/download_tiles_v2.cpython-312.pyc
 __pycache__/fill_gaps.cpython-312.pyc
 __pycache__/tiles_common.cpython-312.pyc
+__pycache__/fetch_cell.cpython-312.pyc

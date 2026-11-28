@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +33,9 @@ job_lock = threading.Lock()
 log_lock = threading.Lock()
 download_process = None
 job = {"id": None, "area_id": None, "method": None, "status": "idle", "message": "Choose a region on the map.", "progress": 0, "progress_total": 0, "lines": [], "artifacts": []}
+cell_fetch_jobs: dict[str, dict] = {}
+cell_fetch_lock = threading.Lock()
+cell_fetch_batches: dict[str, dict] = {}
 
 
 def write_log(message: str) -> None:
@@ -293,6 +297,109 @@ def run_download(latitude: float, longitude: float, radius_meters: float, grid_s
             download_process = None
 
 
+def run_cell_fetch(job_id: str, latitude: float, longitude: float, size_m: float, samples_per_axis: int) -> None:
+    command = [
+        sys.executable, "-u", str(BASE_DIR / "fetch_cell.py"),
+        "--latitude", str(latitude), "--longitude", str(longitude),
+        "--size-meters", str(size_m), "--samples-per-axis", str(samples_per_axis),
+    ]
+    write_log(f"cell fetch start id={job_id} lat={latitude:.6f} lon={longitude:.6f} size={size_m:.1f} samples={samples_per_axis}")
+    try:
+        process = subprocess.Popen(command, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip()
+            with cell_fetch_lock:
+                cell_fetch_jobs[job_id].setdefault("output", []).append(line)
+            if line.startswith("PROGRESS="):
+                try:
+                    progress = json.loads(line[9:])
+                    with cell_fetch_lock:
+                        cell_fetch_jobs[job_id].update(progress, message="Sampling selected cell...")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError("Cell fetch failed.")
+        result_line = next((line for line in reversed(cell_fetch_jobs[job_id].get("output", [])) if line.startswith("RESULT=")), None)
+        if result_line is None:
+            raise RuntimeError("Cell fetch returned no result.")
+        result = json.loads(result_line[7:])
+        hashes = result.get("tile_hashes", [])
+        meters_per_degree_lon = 111320 * max(0.01, math.cos(math.radians(latitude)))
+        added_to = []
+        candidate_areas = []
+        for area_dir in ARTIFACTS_DIR.iterdir():
+            if not area_dir.is_dir() or area_dir == GLOBAL_TILES_DIR or not (area_dir / "metadata.json").exists():
+                continue
+            metadata = area_metadata(area_dir)
+            distance = math.hypot((latitude - float(metadata.get("latitude", 0))) * 111320, (longitude - float(metadata.get("longitude", 0))) * meters_per_degree_lon)
+            candidate_areas.append((distance, area_dir, metadata))
+            if distance > float(metadata.get("radius_meters", 0)) + size_m:
+                continue
+            existing = [str(content_hash) for content_hash in metadata.get("tile_hashes", [])]
+            merged = existing + [content_hash for content_hash in hashes if content_hash not in existing]
+            if len(merged) != len(existing):
+                write_metadata(area_dir, {"tile_hashes": merged, "tile_count": len(merged)})
+                added_to.append(area_dir.name)
+        if hashes and not added_to and candidate_areas:
+            _, area_dir, metadata = min(candidate_areas, key=lambda item: item[0])
+            existing = [str(content_hash) for content_hash in metadata.get("tile_hashes", [])]
+            merged = existing + [content_hash for content_hash in hashes if content_hash not in existing]
+            if len(merged) != len(existing):
+                write_metadata(area_dir, {"tile_hashes": merged, "tile_count": len(merged)})
+                added_to.append(area_dir.name)
+        with cell_fetch_lock:
+            cell_fetch_jobs[job_id].update(result, status="complete", message="Cell fetch complete.", areas=added_to, output=[])
+        write_log(f"cell fetch complete id={job_id} tiles={len(hashes)} raw_hits={result.get('raw_hits', 0)} errors={result.get('errors', 0)} areas={','.join(added_to) or 'none'}")
+    except Exception as exc:
+        with cell_fetch_lock:
+            cell_fetch_jobs[job_id].update(status="error", message=str(exc), output=[])
+        write_log(f"cell fetch error id={job_id}: {exc}")
+
+
+def run_cell_fetch_batch(batch_id: str, cells: list[dict]) -> None:
+    write_log(f"cell batch start id={batch_id} cells={len(cells)}")
+    for index, cell in enumerate(cells, start=1):
+        event = f"cell {index}/{len(cells)} starting at {float(cell['centroid']['latitude']):.6f},{float(cell['centroid']['longitude']):.6f} tiles={cell.get('tiles', 0)}"
+        with cell_fetch_lock:
+            batch = cell_fetch_batches[batch_id]
+            batch.update(current=index, message=f"Fetching cell {index} of {len(cells)}...")
+            batch["events"].append(event)
+            batch["events"] = batch["events"][-20:]
+        write_log(f"cell batch {batch_id}: {event}")
+        job_id = uuid.uuid4().hex
+        latitude = float(cell["centroid"]["latitude"])
+        longitude = float(cell["centroid"]["longitude"])
+        size_m = float(cell["size_m"])
+        with cell_fetch_lock:
+            cell_fetch_jobs[job_id] = {"id": job_id, "batch_id": batch_id, "status": "running", "message": "Starting cell fetch...", "latitude": latitude, "longitude": longitude, "size_m": size_m, "command": "", "completed": 0, "total": 0, "raw_hits": 0, "unique_tiles": 0, "hit_offsets": [], "errors": 0, "center_elevation_m": None, "output": []}
+        threading.Thread(target=run_cell_fetch, args=(job_id, latitude, longitude, size_m, 7), daemon=True).start()
+        while True:
+            with cell_fetch_lock:
+                status = cell_fetch_jobs[job_id].get("status")
+            if status != "running":
+                break
+            time.sleep(0.25)
+        with cell_fetch_lock:
+            result = dict(cell_fetch_jobs[job_id])
+            batch = cell_fetch_batches[batch_id]
+            batch["tile_hashes"] += len(result.get("tile_hashes", []))
+            batch["errors"] += int(result.get("errors", 0))
+            if result.get("status") == "complete":
+                batch["completed"] += 1
+                event = f"cell {index}/{len(cells)} complete: tiles={result.get('unique_tiles', 0)} raw_hits={result.get('raw_hits', 0)} errors={result.get('errors', 0)}"
+            else:
+                batch["failed"] += 1
+                event = f"cell {index}/{len(cells)} failed: {result.get('message', 'unknown error')}"
+            batch["events"].append(event)
+            batch["events"] = batch["events"][-20:]
+        write_log(f"cell batch {batch_id}: {event}")
+    with cell_fetch_lock:
+        cell_fetch_batches[batch_id].update(status="complete", message="Batch cell fetch complete.")
+    write_log(f"cell batch complete id={batch_id} completed={len(cells)}")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         write_log(f"http: {self.address_string()} - {format % args}")
@@ -310,6 +417,19 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             with job_lock:
                 self.send_json(dict(job))
+            return
+        if parsed.path == "/api/fetch-cell-status":
+            fetch_id = parse_qs(parsed.query).get("id", [""])[0]
+            with cell_fetch_lock:
+                status = dict(cell_fetch_jobs.get(fetch_id, {"status": "missing", "message": "Unknown cell fetch."}))
+                status.pop("output", None)
+            self.send_json(status, 404 if status.get("status") == "missing" else 200)
+            return
+        if parsed.path == "/api/fetch-cell-batch-status":
+            fetch_id = parse_qs(parsed.query).get("id", [""])[0]
+            with cell_fetch_lock:
+                status = dict(cell_fetch_batches.get(fetch_id, {"status": "missing", "message": "Unknown batch fetch."}))
+            self.send_json(status, 404 if status.get("status") == "missing" else 200)
             return
         if parsed.path == "/api/areas":
             ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -391,6 +511,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/merge-cell":
             self.merge_cell()
+            return
+        if path == "/api/fetch-cell":
+            self.fetch_cell()
+            return
+        if path == "/api/fetch-cell-batch":
+            self.fetch_cell_batch()
             return
         if path != "/api/start":
             self.send_error(404)
@@ -507,6 +633,43 @@ class Handler(BaseHTTPRequestHandler):
             if merge_dir:
                 shutil.rmtree(merge_dir, ignore_errors=True)
             self.send_json({"error": str(exc) or "Invalid cell merge request."}, 400)
+
+    def fetch_cell(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(length))
+            latitude = float(data["latitude"])
+            longitude = float(data["longitude"])
+            size_m = max(5.0, min(100.0, float(data["size_m"])))
+            samples_per_axis = max(1, min(9, int(data.get("samples_per_axis", 7))))
+            command = [
+                sys.executable, "-u", str(BASE_DIR / "fetch_cell.py"),
+                "--latitude", str(latitude), "--longitude", str(longitude),
+                "--size-meters", str(size_m), "--samples-per-axis", str(samples_per_axis),
+            ]
+            fetch_id = uuid.uuid4().hex
+            with cell_fetch_lock:
+                cell_fetch_jobs[fetch_id] = {"id": fetch_id, "status": "running", "message": "Starting cell fetch...", "latitude": latitude, "longitude": longitude, "size_m": size_m, "command": " ".join(command), "completed": 0, "total": 0, "raw_hits": 0, "unique_tiles": 0, "hit_offsets": [], "errors": 0, "center_elevation_m": None, "output": []}
+            threading.Thread(target=run_cell_fetch, args=(fetch_id, latitude, longitude, size_m, samples_per_axis), daemon=True).start()
+            self.send_json({"id": fetch_id})
+        except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError, OSError) as exc:
+            self.send_json({"error": str(exc) or "Invalid cell fetch request."}, 400)
+
+    def fetch_cell_batch(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(length))
+            maximum_tiles = max(1, min(4, int(data.get("maximum_tiles", 1))))
+            grid = grid_data("tiles")
+            cells = [cell for cell in grid["cells"] if 1 <= int(cell.get("tiles", 0)) <= maximum_tiles]
+            batch_id = uuid.uuid4().hex
+            with cell_fetch_lock:
+                cell_fetch_batches[batch_id] = {"id": batch_id, "status": "running", "message": "Starting batch cell fetch...", "maximum_tiles": maximum_tiles, "total": len(cells), "current": 0, "completed": 0, "failed": 0, "errors": 0, "tile_hashes": 0, "events": [f"queued {len(cells)} cells with 1 to {maximum_tiles} tiles"]}
+            write_log(f"cell batch request id={batch_id} maximum_tiles={maximum_tiles} selected_cells={len(cells)}")
+            threading.Thread(target=run_cell_fetch_batch, args=(batch_id, cells), daemon=True).start()
+            self.send_json({"id": batch_id, "total": len(cells), "maximum_tiles": maximum_tiles})
+        except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError, OSError) as exc:
+            self.send_json({"error": str(exc) or "Invalid batch cell fetch request."}, 400)
 
     def send_file(self, path: Path, content_type: str, download: bool = False) -> None:
         data = path.read_bytes()

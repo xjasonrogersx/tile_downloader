@@ -225,6 +225,35 @@ def is_point_in_box(point: tuple[float, float, float], box: list[float]) -> bool
     return bool(np.all(np.abs(local_pos) <= 1.0 + 1e-9))
 
 
+def is_box_intersecting_obb(box: list[float], other_center: tuple[float, float, float], other_axes: list[tuple[float, float, float]]) -> bool:
+    """Check whether a Cesium oriented box intersects another oriented box."""
+    box_center = np.asarray(box[:3], dtype=float)
+    box_vectors = [np.asarray(box[index:index + 3], dtype=float) for index in (3, 6, 9)]
+    other_center_array = np.asarray(other_center, dtype=float)
+    other_vectors = [np.asarray(axis, dtype=float) for axis in other_axes]
+    box_extents = [float(np.linalg.norm(vector)) for vector in box_vectors]
+    other_extents = [float(np.linalg.norm(vector)) for vector in other_vectors]
+    box_units = [vector / extent for vector, extent in zip(box_vectors, box_extents) if extent > 1e-9]
+    other_units = [vector / extent for vector, extent in zip(other_vectors, other_extents) if extent > 1e-9]
+    axes = box_units + other_units
+    axes.extend(
+        np.cross(box_axis, other_axis)
+        for box_axis in box_units
+        for other_axis in other_units
+    )
+    center_delta = other_center_array - box_center
+    for axis in axes:
+        axis_length = float(np.linalg.norm(axis))
+        if axis_length <= 1e-9:
+            continue
+        unit_axis = axis / axis_length
+        box_radius = sum(extent * abs(float(np.dot(unit_axis, unit))) for extent, unit in zip(box_extents, box_units))
+        other_radius = sum(extent * abs(float(np.dot(unit_axis, unit))) for extent, unit in zip(other_extents, other_units))
+        if abs(float(np.dot(center_delta, unit_axis))) > box_radius + other_radius + 1e-6:
+            return False
+    return True
+
+
 def build_tile_url(uri: str, api_key: str, parent_url: str | None = None) -> str:
     if parent_url and not uri.startswith("http"):
         parsed_parent = urlparse(parent_url)
@@ -366,10 +395,13 @@ def traverse_for_leaf_glbs(
     api_key: str,
     parent_url: str,
     depth: int = 0,
+    region_axes: list[tuple[float, float, float]] | None = None,
 ) -> list[bytes]:
     """Collect every matching street-level GLB in intersecting hierarchy branches."""
     bounding_box = node.get("boundingVolume", {}).get("box")
-    if bounding_box and not is_point_in_box(target_ecef, bounding_box):
+    if bounding_box and not is_point_in_box(target_ecef, bounding_box) and (
+        region_axes is None or not is_box_intersecting_obb(bounding_box, region_axes[0], region_axes[1:])
+    ):
         return []
 
     matches = []
@@ -389,7 +421,9 @@ def traverse_for_leaf_glbs(
             continue
         if data_type == "json":
             matches.extend(
-                traverse_for_leaf_glbs(data["root"], target_ecef, api_key, url, depth + 1)
+                traverse_for_leaf_glbs(
+                    data["root"], target_ecef, api_key, url, depth + 1, region_axes
+                )
             )
         elif math.isclose(
             node.get("geometricError", float("inf")), TARGET_GEOMETRIC_ERROR, abs_tol=1e-6
